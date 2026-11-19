@@ -2,12 +2,20 @@
 #
 # envs/dev, envs/qa and envs/prod are a single call to this module with
 # different values. The wiring that must be identical everywhere (which queue
-# feeds which service, which role may publish where, which secret reaches
+# feeds which module, which role may publish where, which secret reaches
 # which container) therefore exists in one place and cannot drift between
 # environments.
 #
+# The application is a modular monolith: ONE image that contains every module.
+# This module deploys it as one service, the nucleo, plus one service for each
+# module listed in var.promoted_modules. Moving a module between the two is a
+# change of that variable; no file of this module changes.
+#
 #   main.tf      network, cluster and load balancer, registry, messaging, database
-#   services.tf  the two services, side by side, and the connection budget
+#   catalog.tf   the modules of the application and where each one is
+#   services.tf  the nucleo, one service per promoted module, the connection budget
+#   routing.tf   one listener rule per module
+#   deploy.tf    what the deploy pipeline reads: services to deploy and the release
 #   secrets.tf   application secrets that are not database passwords
 #   cicd.tf      GitHub Actions roles
 
@@ -23,19 +31,17 @@ locals {
   partition  = data.aws_partition.current.partition
   region     = data.aws_region.current.region
 
-  # Repository names are part of the contract with the build pipeline and
-  # carry no environment: one image is built once and promoted.
-  repository_names = {
-    lotes     = "${local.project}/lotes-service"
-    giftcards = "${local.project}/giftcards-service"
-  }
+  # One application, one image, one repository. The name is part of the
+  # contract with the build pipeline and carries no environment: the image is
+  # built once and promoted from one environment to the next.
+  repository_name = "${local.project}/app"
 
   # Derived, not read from module.ecr, so that an environment which does not
-  # own the repositories (create_account_level_resources = false) needs no
-  # lookup of resources that may not exist yet.
-  ecr_registry    = "${local.account_id}.dkr.ecr.${local.region}.${data.aws_partition.current.dns_suffix}"
-  repository_urls = { for svc, name in local.repository_names : svc => "${local.ecr_registry}/${name}" }
-  repository_arns = { for svc, name in local.repository_names : svc => "arn:${local.partition}:ecr:${local.region}:${local.account_id}:repository/${name}" }
+  # own the repository (create_account_level_resources = false) needs no
+  # lookup of a resource that may not exist yet.
+  ecr_registry   = "${local.account_id}.dkr.ecr.${local.region}.${data.aws_partition.current.dns_suffix}"
+  repository_url = "${local.ecr_registry}/${local.repository_name}"
+  repository_arn = "arn:${local.partition}:ecr:${local.region}:${local.account_id}:repository/${local.repository_name}"
 }
 
 # -----------------------------------------------------------------------------
@@ -81,7 +87,7 @@ module "ecr" {
   count  = var.create_account_level_resources ? 1 : 0
   source = "../ecr"
 
-  repositories = toset(values(local.repository_names))
+  repositories = toset([local.repository_name])
 }
 
 # -----------------------------------------------------------------------------
@@ -114,11 +120,12 @@ module "database" {
   vpc_id      = module.network.vpc_id
   subnet_ids  = module.network.private_subnet_ids
 
-  # The only clients: the tasks of the two services.
-  allowed_security_group_ids = {
-    lotes     = module.lotes.security_group_id
-    giftcards = module.giftcards.security_group_id
-  }
+  # The only clients: the tasks of the nucleo (and the migration task, which
+  # runs with its security group) and of every promoted module's service.
+  allowed_security_group_ids = merge(
+    { nucleo = module.nucleo.security_group_id },
+    { for name, service in module.promoted : name => service.security_group_id },
+  )
 
   instance_class           = var.database.instance_class
   max_connections          = var.database.max_connections
@@ -129,12 +136,11 @@ module "database" {
   deletion_protection      = var.database.deletion_protection
   skip_final_snapshot      = var.database.skip_final_snapshot
 
-  # One schema and two roles per service. The connection limit of each
-  # application role is the number checked by the budget in services.tf.
-  services = {
-    lotes     = { app_connection_limit = var.lotes.db_connection_limit }
-    giftcards = { app_connection_limit = var.giftcards.db_connection_limit }
-  }
+  # One schema and two roles per MODULE, wherever the module runs: sharing a
+  # process does not give a module access to another module's tables. The
+  # connection limit of each application role is the number checked by the
+  # budget in services.tf.
+  services = { for name, cfg in var.modules : name => { app_connection_limit = cfg.db_connection_limit } }
 
   password_version            = var.database.password_version
   secret_recovery_window_days = var.secret_recovery_window_days

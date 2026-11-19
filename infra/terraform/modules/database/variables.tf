@@ -122,10 +122,10 @@ variable "log_retention_days" {
 
 variable "services" {
   description = <<-EOT
-    Services that get a schema and two roles in the database, keyed by service
+    Owners of data that get a schema and two roles in the database, keyed by
     name (lowercase letters, digits and underscores: it becomes a PostgreSQL
-    identifier). `app_connection_limit` is the CONNECTION LIMIT of the
-    <service>_app role.
+    identifier). The platform passes the modules of the application here.
+    `app_connection_limit` is the CONNECTION LIMIT of the <service>_app role.
   EOT
   type = map(object({
     app_connection_limit = number

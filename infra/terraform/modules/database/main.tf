@@ -1,8 +1,12 @@
-# One PostgreSQL instance, one schema per service.
+# One PostgreSQL instance, one schema per owner of data.
 #
-# Isolation between services is done inside PostgreSQL (roles and schemas, see
-# bootstrap.tf), not with separate instances. This file owns the instance and
-# its network boundary.
+# This module calls that owner a "service": whoever gets a schema and its two
+# roles. In this application it is a MODULE of the monolith (lotes,
+# giftcards), wherever the module runs: var.services is keyed by module name.
+#
+# Isolation is done inside PostgreSQL (roles and schemas, see bootstrap.tf),
+# not with separate instances. This file owns the instance and its network
+# boundary.
 
 locals {
   identifier = "${var.name_prefix}-postgres"

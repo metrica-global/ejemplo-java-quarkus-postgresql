@@ -1,9 +1,13 @@
-# modules/ecs-service: the autoscaling switch.
+# modules/ecs-service: one deployment of the application.
 #
-# The same module, with the same inputs, is planned twice: once without
-# `autoscaling` and once with it. The assertions are the claim the reference
-# makes: a fixed service has NO Application Auto Scaling resources at all, and
-# an autoscaled one has a target plus the CPU and backlog-per-task policies.
+# The same module, with the same inputs, is planned without `autoscaling` and
+# with it. The assertions are the claim the reference makes: a fixed service
+# has NO Application Auto Scaling resources at all, and an autoscaled one has a
+# target plus the CPU and backlog-per-task policies.
+#
+# The last runs apply the module (against the mocked provider: nothing is
+# created anywhere) to follow one service through time: the image it was
+# created with is kept, whatever is released afterwards.
 
 mock_provider "aws" {
   source = "./mocks/aws"
@@ -18,13 +22,12 @@ variables {
   vpc_id       = "vpc-00000000000000000"
   subnet_ids   = ["subnet-00000000000000001", "subnet-00000000000000002"]
 
-  alb_security_group_id  = "sg-00000000000000000"
-  listener_arn           = "arn:aws:elasticloadbalancing:us-east-1:123456789012:listener/app/zonacards-test-alb/0000000000000000/0000000000000000"
-  listener_rule_priority = 200
-  path_patterns          = ["/api/v1/giftcards*"]
+  alb_security_group_id = "sg-00000000000000000"
+  target_group_arn      = "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/zonacards-test-giftcards/0000000000000000"
+  listener_rule_arns    = ["arn:aws:elasticloadbalancing:us-east-1:123456789012:listener-rule/app/zonacards-test-alb/0000000000000000/0000000000000000/0000000000000000"]
 
-  image               = "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/giftcards-service:test"
-  ecr_repository_arns = ["arn:aws:ecr:us-east-1:123456789012:repository/zonacards/giftcards-service"]
+  image               = "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.0.0"
+  ecr_repository_arns = ["arn:aws:ecr:us-east-1:123456789012:repository/zonacards/app"]
   cpu                 = 1024
   memory              = 2048
 }
@@ -237,7 +240,7 @@ run "autoscaling_without_queue_scales_on_cpu_only" {
   }
 }
 
-run "health_checks_use_the_liveness_endpoint" {
+run "the_container_is_checked_on_liveness_and_registered_in_the_given_target_group" {
   command = plan
 
   module {
@@ -245,18 +248,24 @@ run "health_checks_use_the_liveness_endpoint" {
   }
 
   assert {
-    condition     = aws_lb_target_group.this.health_check[0].path == "/q/health/live"
-    error_message = "The target group must check liveness: a readiness check would replace every task on a database blip."
-  }
-
-  assert {
     condition     = strcontains(aws_ecs_task_definition.service.container_definitions, "http://localhost:8080/q/health/live")
-    error_message = "The container health check must use the same liveness endpoint."
+    error_message = "The container health check must use the liveness endpoint: a readiness check would replace every task on a database blip."
   }
 
   assert {
-    condition     = aws_lb_target_group.this.port == 8080 && aws_lb_target_group.this.target_type == "ip"
-    error_message = "The target group must send traffic to port 8080 of the task IPs."
+    condition = (
+      one(aws_ecs_service.fixed[0].load_balancer).target_group_arn == "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/zonacards-test-giftcards/0000000000000000" &&
+      one(aws_ecs_service.fixed[0].load_balancer).container_name == "app" &&
+      one(aws_ecs_service.fixed[0].load_balancer).container_port == 8080
+    )
+    error_message = "The tasks must register port 8080 of the container `app` in the target group the caller created."
+  }
+
+  # The pipeline replaces the image of the container with this name, in every
+  # service and in the migration task, so the name does not depend on the service.
+  assert {
+    condition     = jsondecode(aws_ecs_task_definition.service.container_definitions)[0].name == "app" && output.container_name == "app"
+    error_message = "The container must be called `app` whatever the service is."
   }
 }
 
@@ -434,4 +443,74 @@ run "rejects_an_autoscaling_range_that_starts_at_zero" {
   }
 
   expect_failures = [var.autoscaling]
+}
+
+# --- the image over time ---------------------------------------------------------
+#
+# These three runs share one state: they are the life of one service.
+
+run "a_service_is_created_with_the_image_it_is_given" {
+  command = apply
+
+  module {
+    source = "../modules/ecs-service"
+  }
+
+  variables {
+    environment = { ZC_MODULES = "lotes,giftcards" }
+  }
+
+  assert {
+    condition     = jsondecode(aws_ecs_task_definition.service.container_definitions)[0].image == "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.0.0"
+    error_message = "The first revision must use the image the service is created with."
+  }
+
+  assert {
+    condition     = output.first_image == "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.0.0"
+    error_message = "The module must report the image it was created with."
+  }
+}
+
+run "a_later_release_does_not_touch_the_task_definition" {
+  command = plan
+
+  module {
+    source = "../modules/ecs-service"
+  }
+
+  variables {
+    # The pipeline deployed 1.1.0 and recorded it; the caller now passes that tag.
+    image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.1.0"
+    environment = { ZC_MODULES = "lotes,giftcards" }
+  }
+
+  assert {
+    condition     = jsondecode(aws_ecs_task_definition.service.container_definitions)[0].image == "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.0.0"
+    error_message = "A new release must not show up as a change of the task definition: the pipeline publishes images, not Terraform."
+  }
+}
+
+run "a_change_of_configuration_reaches_the_task_definition" {
+  command = apply
+
+  module {
+    source = "../modules/ecs-service"
+  }
+
+  variables {
+    image       = "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.1.0"
+    environment = { ZC_MODULES = "lotes" }
+  }
+
+  assert {
+    condition = jsondecode(aws_ecs_task_definition.service.container_definitions)[0].environment == [
+      { name = "ZC_MODULES", value = "lotes" },
+    ]
+    error_message = "A change of the environment must produce a task definition with the new value: it is what the next deployment starts from."
+  }
+
+  assert {
+    condition     = jsondecode(aws_ecs_task_definition.service.container_definitions)[0].image == "123456789012.dkr.ecr.us-east-1.amazonaws.com/zonacards/app:1.0.0"
+    error_message = "The image of the Terraform revision stays the one of creation; the pipeline replaces it when it deploys."
+  }
 }

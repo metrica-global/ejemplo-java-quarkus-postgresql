@@ -38,43 +38,33 @@ module "zonacards" {
   secret_recovery_window_days = var.secret_recovery_window_days
 
   # ---------------------------------------------------------------------------
-  # The two services.
+  # The application: one image, deployed as one service or as several.
   #
-  # Same module, same arguments. `lotes` runs a fixed number of tasks.
-  # `giftcards` scales horizontally. The whole difference is the `autoscaling`
-  # object: without it no scalable target and no scaling policy are created.
+  # `nucleo` serves every module that is not in `promoted_modules`. A module
+  # listed there gets its own service, its own route and, if it asks for it,
+  # its own autoscaling, from the same image. Promoting a module is a change of
+  # that one variable.
   # ---------------------------------------------------------------------------
 
-  lotes = {
-    cpu                 = var.lotes_cpu
-    memory              = var.lotes_memory
-    db_pool_max         = var.lotes_db_pool_max
-    db_connection_limit = var.lotes_db_connection_limit
-
-    desired_count = var.lotes_tasks # fixed: Terraform owns the task count
+  nucleo = {
+    cpu           = var.nucleo_cpu
+    memory        = var.nucleo_memory
+    desired_count = var.nucleo_tasks
   }
 
-  giftcards = {
-    cpu                 = var.giftcards_cpu
-    memory              = var.giftcards_memory
-    db_pool_max         = var.giftcards_db_pool_max
-    db_connection_limit = var.giftcards_db_connection_limit
-
-    autoscaling = {
-      min        = var.giftcards_min_tasks
-      max        = var.giftcards_max_tasks
-      cpu_target = var.giftcards_cpu_target # average CPU, percent
-
-      # Backlog per task: visible messages in the work queue / running tasks.
-      queue = {
-        name                    = "giftcards-generacion"
-        backlog_per_task_target = var.giftcards_backlog_per_task_target
-      }
-
-      scale_out_cooldown = 60  # add tasks quickly
-      scale_in_cooldown  = 300 # remove them slowly
+  # Database sizing belongs to the module, wherever it runs.
+  modules = {
+    lotes = {
+      db_pool_max         = var.lotes_db_pool_max
+      db_connection_limit = var.lotes_db_connection_limit
+    }
+    giftcards = {
+      db_pool_max         = var.giftcards_db_pool_max
+      db_connection_limit = var.giftcards_db_connection_limit
     }
   }
+
+  promoted_modules = var.promoted_modules
 
   # ---------------------------------------------------------------------------
   # Received, not provisioned

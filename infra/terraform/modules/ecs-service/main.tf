@@ -1,9 +1,16 @@
-# One Fargate service behind the shared load balancer.
+# One Fargate service behind the shared load balancer: one DEPLOYMENT of the
+# application. Every service runs the same image; which modules it serves is
+# an environment variable (ZC_MODULES) the caller sets.
 #
 # The module is the same for a service that runs a fixed number of tasks and
 # for one that scales horizontally. The only switch is var.autoscaling:
 #   null  -> aws_ecs_service.fixed, nothing from autoscaling.tf
 #   set   -> aws_ecs_service.autoscaled + scalable target + policies
+#
+# The module does NOT create the target group nor the listener rules that send
+# traffic to it: it receives the target group its tasks register in. Routing
+# belongs to the caller, because where a module's API goes can change (see
+# modules/platform/routing.tf) while this service stays as it is.
 
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
@@ -73,55 +80,35 @@ resource "aws_vpc_security_group_egress_rule" "all" {
 }
 
 # -----------------------------------------------------------------------------
-# Load balancer: target group + path rule
-# -----------------------------------------------------------------------------
-
-resource "aws_lb_target_group" "this" {
-  name        = local.name
-  vpc_id      = var.vpc_id
-  target_type = "ip" # required by Fargate (awsvpc network mode)
-  port        = var.container_port
-  protocol    = "HTTP"
-
-  deregistration_delay = var.deregistration_delay_seconds
-
-  # Liveness, not readiness, on purpose: a failing target group health check
-  # makes ECS replace the task, and readiness includes the database, so a short
-  # database blip would restart every task at once. /q/health/ready stays informational.
-  health_check {
-    path                = var.health_check_path
-    port                = "traffic-port"
-    protocol            = "HTTP"
-    matcher             = "200"
-    interval            = 15
-    timeout             = 5
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-  }
-}
-
-resource "aws_lb_listener_rule" "this" {
-  listener_arn = var.listener_arn
-  priority     = var.listener_rule_priority
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.this.arn
-  }
-
-  condition {
-    path_pattern {
-      values = var.path_patterns
-    }
-  }
-}
-
-# -----------------------------------------------------------------------------
 # Task definitions
 # -----------------------------------------------------------------------------
 
+# The image this service was CREATED with. Captured once and never updated:
+# after the first revision, the deploy pipeline is the one that publishes
+# images (it registers a revision per release and Terraform ignores the
+# service's task definition). Without this, every release would show up in the
+# next plan as task definitions to replace.
+#
+# What it buys: var.image can follow the release that is deployed now, so a
+# service created later (a module promoted to its own service) starts with the
+# image the rest of the system is running, not with the one of the first day.
+resource "terraform_data" "first_image" {
+  input = var.image
+
+  lifecycle {
+    ignore_changes = [input]
+  }
+}
+
 resource "aws_ecs_task_definition" "service" {
-  family                   = local.name
+  family = local.name
+
+  # A task definition cannot be modified: a change of configuration registers
+  # a new revision ("must be replaced" in the plan). The previous revision is
+  # kept, because the service may still be running it and the deployment
+  # circuit breaker may have to go back to it.
+  skip_destroy = true
+
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = var.cpu
@@ -136,8 +123,8 @@ resource "aws_ecs_task_definition" "service" {
 
   container_definitions = jsonencode([
     {
-      name      = var.service_name
-      image     = var.image
+      name      = var.container_name
+      image     = terraform_data.first_image.input
       essential = true
 
       portMappings = [
@@ -148,7 +135,10 @@ resource "aws_ecs_task_definition" "service" {
       environment = [for name in sort(keys(var.environment)) : { name = name, value = var.environment[name] }]
       secrets     = [for name in sort(keys(var.secrets)) : { name = name, valueFrom = var.secrets[name] }]
 
-      # Same liveness endpoint as the target group: see the comment there.
+      # Liveness, not readiness, on purpose: a failing health check makes ECS
+      # replace the task, and readiness includes the database, so a short
+      # database blip would restart every task at once. The target group the
+      # caller creates must use the same endpoint.
       healthCheck = {
         command     = local.health_check_command
         interval    = 15
@@ -168,14 +158,15 @@ resource "aws_ecs_task_definition" "service" {
   ])
 }
 
-# Schema migrations never run inside the long-running service. This second
-# task definition uses the same image with the schema owner's credentials and
-# its own execution role, so the service's roles can never read the owner
-# password. It has no task role: a migration makes no AWS API calls.
+# Schema migrations never run inside a long-running service. This second task
+# definition uses the same image with the schema owners' credentials and its
+# own execution role, so the service's roles can never read an owner password.
+# It has no task role: a migration makes no AWS API calls.
 resource "aws_ecs_task_definition" "migrate" {
   count = var.migrate == null ? 0 : 1
 
   family                   = "${local.name}-migrate"
+  skip_destroy             = true # as above: a change registers a revision, nothing is deregistered
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = var.cpu
@@ -189,8 +180,8 @@ resource "aws_ecs_task_definition" "migrate" {
 
   container_definitions = jsonencode([
     {
-      name      = var.service_name
-      image     = var.image
+      name      = var.container_name
+      image     = terraform_data.first_image.input
       essential = true
 
       environment = [for name in sort(keys(var.migrate.environment)) : { name = name, value = var.migrate.environment[name] }]
@@ -260,8 +251,8 @@ resource "aws_ecs_service" "fixed" {
   }
 
   load_balancer {
-    target_group_arn = aws_lb_target_group.this.arn
-    container_name   = var.service_name
+    target_group_arn = var.target_group_arn
+    container_name   = var.container_name
     container_port   = var.container_port
   }
 
@@ -269,8 +260,9 @@ resource "aws_ecs_service" "fixed" {
     ignore_changes = [task_definition]
   }
 
-  # The target group must be attached to the listener before ECS accepts it.
-  depends_on = [aws_lb_listener_rule.this]
+  # ECS only accepts a target group that is attached to a load balancer, and
+  # the rules that attach this one belong to the caller.
+  depends_on = [var.listener_rule_arns]
 }
 
 resource "aws_ecs_service" "autoscaled" {
@@ -305,8 +297,8 @@ resource "aws_ecs_service" "autoscaled" {
   }
 
   load_balancer {
-    target_group_arn = aws_lb_target_group.this.arn
-    container_name   = var.service_name
+    target_group_arn = var.target_group_arn
+    container_name   = var.container_name
     container_port   = var.container_port
   }
 
@@ -314,7 +306,7 @@ resource "aws_ecs_service" "autoscaled" {
     ignore_changes = [task_definition, desired_count]
   }
 
-  depends_on = [aws_lb_listener_rule.this]
+  depends_on = [var.listener_rule_arns]
 }
 
 locals {

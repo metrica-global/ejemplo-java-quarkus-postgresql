@@ -91,3 +91,9 @@ demo-escalado: ## Mide el mismo lote con 1, 2 y 4 réplicas de giftcards promovi
 .PHONY: demo-autoescalado
 demo-autoescalado: ## SIMULA la política de autoescalado sobre la cola real del sistema local
 	scripts/demo-autoescalado.sh
+
+# --- Infraestructura ---------------------------------------------------------------------------
+
+.PHONY: ensayo-terraform
+ensayo-terraform: ## Ensaya la promoción y la reintegración en el Terraform de dev, con el proveedor real de AWS contra un emulador desechable
+	scripts/tf-ensayo-promocion.sh

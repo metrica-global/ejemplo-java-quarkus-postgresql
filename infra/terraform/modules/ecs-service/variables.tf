@@ -8,7 +8,7 @@ variable "name_prefix" {
 }
 
 variable "service_name" {
-  description = "Short name of the service, e.g. lotes. Resources are named <name_prefix>-<service_name>."
+  description = "Short name of the service, e.g. nucleo. Resources are named <name_prefix>-<service_name>."
   type        = string
 }
 
@@ -41,31 +41,25 @@ variable "alb_security_group_id" {
   type        = string
 }
 
-variable "listener_arn" {
-  description = "Listener the path rule is attached to."
+variable "target_group_arn" {
+  description = "Target group the tasks register in (target type ip, health check on health_check_path). Created by the caller together with the listener rules."
   type        = string
 }
 
-variable "listener_rule_priority" {
-  description = "Priority of the path rule. Must be unique per listener."
-  type        = number
-}
-
-variable "path_patterns" {
-  description = "Path patterns routed to this service, e.g. [\"/api/v1/lotes*\"]."
+variable "listener_rule_arns" {
+  description = <<-EOT
+    ARNs of the listener rules that forward to target_group_arn. The module
+    does not use the values: receiving them makes the ECS service wait until
+    its target group is attached to the load balancer, which ECS requires
+    before it accepts the service.
+  EOT
   type        = list(string)
 }
 
 variable "health_check_path" {
-  description = "Path used by BOTH the target group health check and the container health check. Must be the liveness endpoint, see the comment in main.tf."
+  description = "Path of the container health check. Must be the liveness endpoint (see the comment in main.tf) and the same path the target group checks."
   type        = string
   default     = "/q/health/live"
-}
-
-variable "deregistration_delay_seconds" {
-  description = "Time the load balancer keeps draining in-flight requests of a task that is going away."
-  type        = number
-  default     = 30
 }
 
 # -----------------------------------------------------------------------------
@@ -73,8 +67,18 @@ variable "deregistration_delay_seconds" {
 # -----------------------------------------------------------------------------
 
 variable "image" {
-  description = "Image of the first task definition revision, <repository>:<tag>. Later revisions are published by the deploy pipeline."
+  description = <<-EOT
+    Image the service is CREATED with, <repository>:<tag>. It is read once, when
+    the service is first applied; later values are ignored, because every
+    revision after the first is published by the deploy pipeline.
+  EOT
   type        = string
+}
+
+variable "container_name" {
+  description = "Name of the container in both task definitions. The deploy pipeline replaces the image of the container with this name, so it is the same in every service."
+  type        = string
+  default     = "app"
 }
 
 variable "ecr_repository_arns" {
@@ -125,8 +129,9 @@ variable "migrate" {
   description = <<-EOT
     Definition of the one-off migration task (<service>-migrate): same image,
     its own environment and secrets, its own execution role. The deploy
-    pipeline runs it with `aws ecs run-task` before updating the service.
-    null: no migration task definition.
+    pipeline runs it with `aws ecs run-task` before updating any service.
+    null: no migration task definition. The application has ONE migration
+    task, so only one service of an environment declares it.
   EOT
   type = object({
     environment = map(string)

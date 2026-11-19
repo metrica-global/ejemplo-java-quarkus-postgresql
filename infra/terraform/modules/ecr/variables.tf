@@ -1,5 +1,5 @@
 variable "repositories" {
-  description = "Names of the repositories to create, e.g. zonacards/lotes-service."
+  description = "Names of the repositories to create, e.g. zonacards/app."
   type        = set(string)
 }
 

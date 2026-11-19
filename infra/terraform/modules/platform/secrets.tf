@@ -1,4 +1,4 @@
-# Keys of the giftcards service, 32 random bytes each, base64 encoded:
+# Keys of the giftcards module, 32 random bytes each, base64 encoded:
 #
 #   codigo-key       encrypts the gift card code at rest
 #   codigo-hmac-key  keys the blind index used to look a code up
@@ -16,12 +16,12 @@ module "giftcards_keys" {
   secrets = {
     "codigo-key" = {
       name        = "${local.name_prefix}-giftcards-codigo-key"
-      description = "AES-256 key that encrypts gift card codes at rest. 32 random bytes, base64. Read only by the giftcards service."
+      description = "AES-256 key that encrypts gift card codes at rest. 32 random bytes, base64. Read only by the deployments that can serve the giftcards module."
       format      = "base64-256-bit-key"
     }
     "codigo-hmac-key" = {
       name        = "${local.name_prefix}-giftcards-codigo-hmac-key"
-      description = "HMAC key of the blind index over gift card codes. 32 random bytes, base64. Read only by the giftcards service."
+      description = "HMAC key of the blind index over gift card codes. 32 random bytes, base64. Read only by the deployments that can serve the giftcards module."
       format      = "base64-256-bit-key"
     }
   }

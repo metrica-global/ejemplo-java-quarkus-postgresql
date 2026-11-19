@@ -53,17 +53,21 @@ variable "deploy" {
     What the deploy role may touch:
       cluster_arn / cluster_name  the ECS cluster
       service_arns                services it may update
-      run_task_families           task definition families it may run (the migration tasks)
+      run_task_families           task definition families it may run (the migration task)
       passable_role_arns          task and execution roles it may hand to ECS
       log_group_arns              log groups it may read to show task output
+      read_parameter_arns         SSM parameters it may read (what to deploy, what is deployed)
+      write_parameter_arns        SSM parameters it may write (the release it deployed)
   EOT
   type = object({
-    cluster_arn        = string
-    cluster_name       = string
-    service_arns       = list(string)
-    run_task_families  = list(string)
-    passable_role_arns = list(string)
-    log_group_arns     = list(string)
+    cluster_arn          = string
+    cluster_name         = string
+    service_arns         = list(string)
+    run_task_families    = list(string)
+    passable_role_arns   = list(string)
+    log_group_arns       = list(string)
+    read_parameter_arns  = optional(list(string), [])
+    write_parameter_arns = optional(list(string), [])
   })
 }
 

@@ -1,12 +1,16 @@
 locals {
-  service_modules = {
-    lotes     = module.lotes
-    giftcards = module.giftcards
-  }
+  # Every service of the environment: the nucleo and one per promoted module.
+  service_modules = merge({ nucleo = module.nucleo }, module.promoted)
+
+  service_modules_served = merge(
+    { nucleo = local.nucleo_modules },
+    { for name in keys(module.promoted) : name => [name] },
+  )
 }
 
 # -----------------------------------------------------------------------------
-# What the deploy pipeline needs
+# What the deploy pipeline needs. It reads it from the parameters below, not
+# from these outputs; the outputs are for people.
 # -----------------------------------------------------------------------------
 
 output "cluster_name" {
@@ -14,26 +18,70 @@ output "cluster_name" {
   value       = module.cluster.cluster_name
 }
 
+output "topology" {
+  description = "Where each module of the application is: whether it has its own service, whether the nucleo serves it, and which service receives its API."
+  value       = terraform_data.topology.input
+}
+
 output "services" {
   description = <<-EOT
-    Per service, everything the deploy pipeline needs: the ECS service, the
-    container whose image it replaces, the task definition families it
-    registers revisions in, the migration task family it runs first, the image
-    repository, and the autoscaling summary (null for a fixed service).
+    Per service (the nucleo and one per promoted module): the modules it
+    serves, the ECS service and its target group, the container whose image
+    the pipeline replaces, the task definition family, and the autoscaling
+    summary (null for a fixed service).
   EOT
   value = {
     for name, svc in local.service_modules : name => {
-      service_name                   = svc.service_name
-      container_name                 = svc.container_name
-      task_definition_family         = svc.task_definition_family
-      migrate_task_definition_family = svc.migrate_task_definition_family
-      security_group_id              = svc.security_group_id
-      log_group_name                 = svc.log_group_name
-      repository_url                 = local.repository_urls[name]
-      max_task_count                 = svc.max_task_count
-      autoscaling                    = svc.autoscaling
+      modules                = local.service_modules_served[name]
+      service_name           = svc.service_name
+      service_arn            = svc.service_arn
+      target_group_arn       = aws_lb_target_group.service[name].arn
+      container_name         = svc.container_name
+      task_definition_family = svc.task_definition_family
+      security_group_id      = svc.security_group_id
+      log_group_name         = svc.log_group_name
+      max_task_count         = svc.max_task_count
+      autoscaling            = svc.autoscaling
     }
   }
+}
+
+output "routes" {
+  description = "Per module, its listener rule: the paths of its API and the weight of each target group. The rule is the same resource in every topology; only the weights change."
+  value = {
+    for name, rule in aws_lb_listener_rule.module : name => {
+      listener_rule_arn = rule.arn
+      path_patterns     = local.catalog[name].path_patterns
+      priority          = rule.priority
+      weights = merge(
+        { nucleo = local.placement[name].routed_to == "nucleo" ? 100 : 0 },
+        local.placement[name].own_service ? { (name) = local.placement[name].routed_to == "nucleo" ? 0 : 100 } : {},
+      )
+    }
+  }
+}
+
+output "migrate" {
+  description = "The one migration task of the application: task definition family, and the security group and log group it runs with."
+  value       = local.deploy_descriptor.migrate
+}
+
+output "deploy_parameters" {
+  description = "Names of the SSM parameters the deploy pipeline uses: `deploy` (what to deploy, written by Terraform) and `release` (the tag that is deployed, written by the pipeline)."
+  value = {
+    deploy  = aws_ssm_parameter.deploy.name
+    release = aws_ssm_parameter.release.name
+  }
+}
+
+output "deploy_descriptor" {
+  description = "Content of the `deploy` parameter: cluster, image repository, container, subnets, migration task and the services in deployment order."
+  value       = local.deploy_descriptor
+}
+
+output "repository_url" {
+  description = "URL of the image repository of the application."
+  value       = local.repository_url
 }
 
 output "private_subnet_ids" {
@@ -42,7 +90,7 @@ output "private_subnet_ids" {
 }
 
 output "ecr_registry" {
-  description = "Hostname of the ECR registry the images are pushed to."
+  description = "Hostname of the ECR registry the image is pushed to."
   value       = local.ecr_registry
 }
 
@@ -87,7 +135,7 @@ output "db_bootstrap" {
 }
 
 output "db_connection_budget" {
-  description = "The numbers behind the connection budget check: per service peak tasks x pool against the role's CONNECTION LIMIT, and the total against max_connections."
+  description = "The numbers behind the connection budget check: per module, the peak tasks of every deployment that can serve it x its pool against the role's CONNECTION LIMIT, and the total against max_connections."
   value       = terraform_data.db_connection_budget.input
 }
 

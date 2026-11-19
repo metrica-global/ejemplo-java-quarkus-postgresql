@@ -10,7 +10,12 @@ output "service_arn" {
 
 output "container_name" {
   description = "Name of the container inside both task definitions. The deploy pipeline replaces the image of this container."
-  value       = var.service_name
+  value       = var.container_name
+}
+
+output "first_image" {
+  description = "Image the service was created with (see terraform_data.first_image). Not the image it runs now: that is whatever the deploy pipeline released last."
+  value       = terraform_data.first_image.input
 }
 
 output "task_definition_family" {
@@ -43,11 +48,6 @@ output "security_group_id" {
   value       = aws_security_group.this.id
 }
 
-output "target_group_arn" {
-  description = "ARN of the target group of the service."
-  value       = aws_lb_target_group.this.arn
-}
-
 output "log_group_name" {
   description = "Name of the CloudWatch log group of the service and its migration task."
   value       = aws_cloudwatch_log_group.this.name
@@ -75,6 +75,11 @@ output "max_task_count" {
 output "peak_task_count" {
   description = "Most tasks that can exist at once during a rolling deployment: max_task_count x deployment_maximum_percent."
   value       = local.peak_task_count
+}
+
+output "environment" {
+  description = "Plain environment variables of the service container. Never contains a secret: those are in var.secrets and reach the container through ECS."
+  value       = var.environment
 }
 
 output "environment_names" {

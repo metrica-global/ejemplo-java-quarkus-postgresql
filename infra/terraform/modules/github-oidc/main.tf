@@ -198,6 +198,28 @@ data "aws_iam_policy_document" "deploy" {
     actions   = ["logs:GetLogEvents", "logs:FilterLogEvents"]
     resources = [for arn in var.deploy.log_group_arns : "${arn}:*"]
   }
+
+  # The list of services to deploy is published by Terraform in a parameter;
+  # the release that was deployed is recorded in another one.
+  dynamic "statement" {
+    for_each = length(var.deploy.read_parameter_arns) > 0 ? [1] : []
+
+    content {
+      sid       = "ReadDeployParameters"
+      actions   = ["ssm:GetParameter"]
+      resources = var.deploy.read_parameter_arns
+    }
+  }
+
+  dynamic "statement" {
+    for_each = length(var.deploy.write_parameter_arns) > 0 ? [1] : []
+
+    content {
+      sid       = "RecordTheRelease"
+      actions   = ["ssm:PutParameter"]
+      resources = var.deploy.write_parameter_arns
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "deploy" {

@@ -120,83 +120,78 @@ variable "secret_recovery_window_days" {
 }
 
 # -----------------------------------------------------------------------------
-# lotes: fixed number of tasks
+# The application
+#
+# One image with every module. By default one service, the nucleo, serves them
+# all; promoted_modules lists the modules that get a service of their own.
 # -----------------------------------------------------------------------------
 
-variable "lotes_tasks" {
-  description = "Number of tasks of the lotes service."
+variable "nucleo_tasks" {
+  description = "Number of tasks of the nucleo, the service that serves every module that has not been promoted."
   type        = number
 }
 
-variable "lotes_cpu" {
-  description = "Fargate CPU units of a lotes task."
-  type        = number
-  default     = 512
-}
-
-variable "lotes_memory" {
-  description = "Fargate memory of a lotes task, in MiB."
+variable "nucleo_cpu" {
+  description = "Fargate CPU units of a nucleo task."
   type        = number
   default     = 1024
 }
 
+variable "nucleo_memory" {
+  description = "Fargate memory of a nucleo task, in MiB."
+  type        = number
+  default     = 2048
+}
+
 variable "lotes_db_pool_max" {
-  description = "ZC_DB_POOL_MAX of lotes: JDBC connections per task."
+  description = "ZC_DB_LOTES_POOL_MAX: JDBC connections of the lotes module per task that serves it."
   type        = number
   default     = 10
 }
 
 variable "lotes_db_connection_limit" {
-  description = "CONNECTION LIMIT of the lotes_app PostgreSQL role. Must cover peak tasks x pool."
+  description = "CONNECTION LIMIT of the lotes_app PostgreSQL role. Must cover the peak tasks of every service that can serve the module x pool."
   type        = number
-}
-
-# -----------------------------------------------------------------------------
-# giftcards: autoscaled
-# -----------------------------------------------------------------------------
-
-variable "giftcards_min_tasks" {
-  description = "Minimum number of giftcards tasks."
-  type        = number
-}
-
-variable "giftcards_max_tasks" {
-  description = "Maximum number of giftcards tasks."
-  type        = number
-}
-
-variable "giftcards_cpu_target" {
-  description = "Average CPU utilisation, in percent, the CPU scaling policy keeps the service at."
-  type        = number
-  default     = 60
-}
-
-variable "giftcards_backlog_per_task_target" {
-  description = "Messages waiting in giftcards-generacion per running task that the backlog scaling policy keeps the service at: acceptable wait / average time to process one message."
-  type        = number
-}
-
-variable "giftcards_cpu" {
-  description = "Fargate CPU units of a giftcards task."
-  type        = number
-  default     = 1024
-}
-
-variable "giftcards_memory" {
-  description = "Fargate memory of a giftcards task, in MiB."
-  type        = number
-  default     = 2048
 }
 
 variable "giftcards_db_pool_max" {
-  description = "ZC_DB_POOL_MAX of giftcards: JDBC connections per task."
+  description = "ZC_DB_GIFTCARDS_POOL_MAX: JDBC connections of the giftcards module per task that serves it."
   type        = number
   default     = 10
 }
 
 variable "giftcards_db_connection_limit" {
-  description = "CONNECTION LIMIT of the giftcards_app PostgreSQL role. Must cover peak tasks x pool."
+  description = "CONNECTION LIMIT of the giftcards_app PostgreSQL role. Sized for the day the module is promoted: nucleo tasks plus the tasks of its own service, x pool."
   type        = number
+}
+
+variable "promoted_modules" {
+  description = <<-EOT
+    Modules deployed as a service of their own, keyed by module name. Empty by
+    default: the nucleo serves every module. See promocion-giftcards.tfvars
+    for a complete example and modules/platform/variables.tf for the meaning
+    of every attribute, `transition` in particular.
+  EOT
+  type = map(object({
+    cpu                  = optional(number, 1024)
+    memory               = optional(number, 2048)
+    desired_count        = optional(number, 2)
+    consumer_concurrency = optional(number, 8)
+    environment          = optional(map(string), {})
+    autoscaling = optional(object({
+      min        = number
+      max        = number
+      cpu_target = optional(number, 60)
+      queue = optional(object({
+        name                    = string
+        backlog_per_task_target = number
+      }))
+      scale_out_cooldown = optional(number, 60)
+      scale_in_cooldown  = optional(number, 300)
+    }))
+    transition = optional(string)
+  }))
+  default = {}
 }
 
 # -----------------------------------------------------------------------------
@@ -204,7 +199,7 @@ variable "giftcards_db_connection_limit" {
 # -----------------------------------------------------------------------------
 
 variable "image_tag" {
-  description = "Tag of the images of the first task definition revision. Must exist in ECR before the services are created."
+  description = "Tag of the image the environment is created with. Must exist in ECR before the first apply; after the first deployment the pipeline records the deployed tag and this value is not read again."
   type        = string
 }
 
