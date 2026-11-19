@@ -1,0 +1,16 @@
+{
+  "specversion": "1.0",
+  "id": "019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77",
+  "source": "/zonacards/lotes",
+  "type": "zonacards.lotes.lote-generado.v1",
+  "subject": "019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10",
+  "time": "2026-11-18T15:04:05.123Z",
+  "datacontenttype": "application/json",
+  "tenantid": "pe",
+  "correlationid": "6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "data": {
+    "loteId": "019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10",
+    "cantidad": 5000
+  }
+}

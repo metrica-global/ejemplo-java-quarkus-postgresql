@@ -48,6 +48,7 @@
     <module>libs/eventx-postgres</module>
     <module>libs/eventx-aws</module>
     <module>libs/server</module>
+    <module>services/lotes-service</module>
   </modules>
 
   <dependencyManagement>
