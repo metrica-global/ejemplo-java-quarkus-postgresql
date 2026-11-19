@@ -1,7 +1,5 @@
 package com.zonacards.kernel;
 
-import java.util.UUID;
-
 public record GiftCardId(String value) implements TypedId {
 
   public static GiftCardId of(String value) {
@@ -9,7 +7,7 @@ public record GiftCardId(String value) implements TypedId {
   }
 
   public static GiftCardId newId() {
-    return new GiftCardId(UUID.randomUUID().toString());
+    return new GiftCardId(Ids.uuidV7().toString());
   }
 
   @Override

@@ -15,6 +15,18 @@ public final class Validation {
     return request;
   }
 
+  /** Checks at the boundary that a path or body value is a UUID, and returns it in canonical form. */
+  public static String uuid(String value, String field) {
+    if (value == null || value.isBlank()) {
+      throw required(field);
+    }
+    try {
+      return java.util.UUID.fromString(value.trim()).toString();
+    } catch (IllegalArgumentException e) {
+      throw invalid(field, "must be a UUID");
+    }
+  }
+
   public static Errx required(String field) {
     return Errx.validation(field + " is required").withDetail("field", field);
   }

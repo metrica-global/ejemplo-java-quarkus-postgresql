@@ -32,11 +32,22 @@
     <!-- Empty by default so that @{argLine} resolves when JaCoCo is not active. -->
     <argLine></argLine>
     <skipITs>false</skipITs>
+    <!-- Quarkus modules override this with org.jboss.logmanager.LogManager. -->
+    <test.logmanager>java.util.logging.LogManager</test.logmanager>
   </properties>
 
   <modules>
     <module>libs/errx</module>
     <module>libs/kernel</module>
+    <module>libs/logx</module>
+    <module>libs/ptrx</module>
+    <module>libs/asyncx</module>
+    <module>libs/testkit</module>
+    <module>libs/dbx</module>
+    <module>libs/eventx</module>
+    <module>libs/eventx-postgres</module>
+    <module>libs/eventx-aws</module>
+    <module>libs/server</module>
   </modules>
 
   <dependencyManagement>
@@ -64,6 +75,56 @@
         <groupId>com.zonacards</groupId>
         <artifactId>zc-kernel</artifactId>
         <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-logx</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-ptrx</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-asyncx</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-testkit</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-dbx</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-eventx</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-eventx-postgres</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-eventx-aws</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zonacards</groupId>
+        <artifactId>zc-server</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit</artifactId>
+        <version>${archunit.version}</version>
       </dependency>
       <dependency>
         <groupId>com.tngtech.archunit</groupId>
@@ -97,7 +158,7 @@
           <configuration>
             <argLine>@{argLine}</argLine>
             <systemPropertyVariables>
-              <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+              <java.util.logging.manager>${test.logmanager}</java.util.logging.manager>
               <maven.home>${maven.home}</maven.home>
             </systemPropertyVariables>
           </configuration>
@@ -111,7 +172,7 @@
             <!-- Test against target/classes, not the packaged jar: Quarkus tests need it. -->
             <classesDirectory>${project.build.outputDirectory}</classesDirectory>
             <systemPropertyVariables>
-              <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+              <java.util.logging.manager>${test.logmanager}</java.util.logging.manager>
               <maven.home>${maven.home}</maven.home>
             </systemPropertyVariables>
           </configuration>

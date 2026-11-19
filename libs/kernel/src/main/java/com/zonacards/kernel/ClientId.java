@@ -1,7 +1,5 @@
 package com.zonacards.kernel;
 
-import java.util.UUID;
-
 public record ClientId(String value) implements TypedId {
 
   public static ClientId of(String value) {
@@ -9,7 +7,7 @@ public record ClientId(String value) implements TypedId {
   }
 
   public static ClientId newId() {
-    return new ClientId(UUID.randomUUID().toString());
+    return new ClientId(Ids.uuidV7().toString());
   }
 
   @Override

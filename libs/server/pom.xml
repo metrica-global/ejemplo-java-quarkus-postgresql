@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.zonacards</groupId>
+    <artifactId>zonacards-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>zc-server</artifactId>
+  <name>Zonacards :: Lib :: server</name>
+  <description>The only library that knows Quarkus: error mapping, request id, AuthContext from the JWT, unit of work over JTA, and the lifecycle, health, metrics and tracing of eventx.</description>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.zonacards</groupId>
+      <artifactId>zc-kernel</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.zonacards</groupId>
+      <artifactId>zc-logx</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.zonacards</groupId>
+      <artifactId>zc-dbx</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.zonacards</groupId>
+      <artifactId>zc-eventx</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.zonacards</groupId>
+      <artifactId>zc-asyncx</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-rest-jackson</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-oidc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-narayana-jta</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-smallrye-health</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-micrometer-registry-prometheus</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-opentelemetry</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- Quarkus only discovers beans and providers of a dependency if the jar carries an index. -->
+      <plugin>
+        <groupId>io.smallrye</groupId>
+        <artifactId>jandex-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>make-index</id>
+            <goals>
+              <goal>jandex</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

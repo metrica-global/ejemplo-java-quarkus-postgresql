@@ -1,7 +1,5 @@
 package com.zonacards.kernel;
 
-import java.util.UUID;
-
 public record LoteId(String value) implements TypedId {
 
   public static LoteId of(String value) {
@@ -9,7 +7,7 @@ public record LoteId(String value) implements TypedId {
   }
 
   public static LoteId newId() {
-    return new LoteId(UUID.randomUUID().toString());
+    return new LoteId(Ids.uuidV7().toString());
   }
 
   @Override
