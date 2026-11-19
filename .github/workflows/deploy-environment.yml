@@ -1,18 +1,30 @@
 # Deploys one image tag to one environment. Called by deploy.yml, once per
 # environment; it is not triggered by any event of its own.
 #
-# Per service, in this order:
-#   1. check that the tag exists in the registry of the environment and
+# The application is ONE image. An environment runs it as one service (the
+# nucleo) or as several (one more per promoted module). Which ones is not
+# written in this file: Terraform publishes it in an SSM parameter,
+# /zonacards/<environment>/deploy, and this workflow reads it at the start of
+# every deployment. Promoting a module changes that parameter; it changes
+# neither this file nor a variable in GitHub.
+#
+# In this order:
+#   1. read what to deploy
+#   2. check that the tag exists in the registry of the environment and
 #      resolves to the expected digest
-#   2. register a new revision of the migration task definition and of the
-#      service task definition, both with the image
-#   3. run the migration task and stop here unless its container exits with 0
-#   4. point the service at the new revision and wait for the rollout
+#   3. register a new revision of the migration task definition and of the
+#      task definition of every service, all with the image
+#   4. run the ONE migration task of the application and stop here unless its
+#      container exits with 0
+#   5. roll the services one by one, in the order of the parameter (the
+#      services of promoted modules first, the nucleo last), and stop at the
+#      first one that fails
+#   6. record the tag as the release of the environment
 #
 # Terraform creates the services and ignores their task definition: every
-# revision after the first one is registered here. The names (cluster, service,
-# families, container) are not hard-coded; they come from the Terraform outputs
-# stored as variables of the GitHub environment (see docs/cicd.md).
+# deployment registers a revision here, starting from the LATEST revision of
+# the family. That is how a change Terraform made to the configuration of a
+# service (for example the modules the nucleo serves) reaches the service.
 name: deploy-environment
 
 on:
@@ -26,14 +38,10 @@ on:
         description: Image tag to deploy
         type: string
         required: true
-      services:
-        description: JSON array with the services to deploy
+      digest:
+        description: Digest the tag must resolve to. Empty skips the comparison.
         type: string
-        required: true
-      digests:
-        description: JSON object with the expected digest per service. An empty object skips the comparison.
-        type: string
-        default: "{}"
+        default: ""
 
 permissions:
   contents: read
@@ -47,94 +55,102 @@ env:
   ROLLOUT_TIMEOUT_MINUTES: "30"
 
 jobs:
-  service:
-    name: ${{ matrix.service }}
+  deploy:
+    name: ${{ inputs.environment }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # One migration and up to a handful of rollouts, each with its own timeout.
+    timeout-minutes: 240
     # Required reviewers and the allowed branches are configured on the
     # environment in GitHub. The job does not start until they are satisfied.
     environment: ${{ inputs.environment }}
-    # One deployment at a time per service and environment. A newer run waits
-    # for the one in progress and replaces an older one that is still waiting.
+    # One deployment at a time per environment. A newer run waits for the one
+    # in progress and replaces an older one that is still waiting.
     concurrency:
-      group: deploy-${{ inputs.environment }}-${{ matrix.service }}
+      group: deploy-${{ inputs.environment }}
       cancel-in-progress: false
     permissions:
       id-token: write # assume the deploy role of the environment
-    strategy:
-      fail-fast: false
-      matrix:
-        service: ${{ fromJSON(inputs.services) }}
     env:
       ENVIRONMENT: ${{ inputs.environment }}
-      SERVICE: ${{ matrix.service }}
       TAG: ${{ inputs.tag }}
-      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      # Both written by Terraform (infra/terraform, output deploy_parameters).
+      DEPLOY_PARAMETER: /zonacards/${{ inputs.environment }}/deploy
+      RELEASE_PARAMETER: /zonacards/${{ inputs.environment }}/release
     steps:
-      - name: Read the configuration of the environment
-        id: cfg
+      - name: Check the configuration of the environment
         env:
           # Named after the variables they come from, for the messages below.
           AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          ECS_SERVICES: ${{ vars.ECS_SERVICES }}
-          ECS_PRIVATE_SUBNET_IDS: ${{ vars.ECS_PRIVATE_SUBNET_IDS }}
-          DIGESTS: ${{ inputs.digests }}
         run: |
           set -euo pipefail
-          shopt -s inherit_errexit
-
           missing=0
-          for name in AWS_REGION AWS_DEPLOY_ROLE_ARN ECS_CLUSTER ECS_SERVICES ECS_PRIVATE_SUBNET_IDS; do
+          for name in AWS_REGION AWS_DEPLOY_ROLE_ARN; do
             if [ -z "${!name}" ]; then
               echo "::error::The variable ${name} is not set for the environment ${ENVIRONMENT} (see docs/cicd.md)."
               missing=1
             fi
           done
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-
-          # ECS_SERVICES is the Terraform output `services`, as JSON.
-          field() {
-            jq -er --arg s "$SERVICE" --arg f "$1" '.[$s][$f] | strings | select(. != "")' <<<"$ECS_SERVICES" || {
-              echo "::error::ECS_SERVICES has no ${1} for the service ${SERVICE}." >&2
-              return 1
-            }
-          }
-          service_name="$(field service_name)"
-          container_name="$(field container_name)"
-          family="$(field task_definition_family)"
-          migrate_family="$(field migrate_task_definition_family)"
-          security_group="$(field security_group_id)"
-          log_group="$(field log_group_name)"
-          repository_url="$(field repository_url)"
-
-          # ECS_PRIVATE_SUBNET_IDS is the Terraform output `private_subnet_ids`.
-          subnets="$(jq -er 'map(strings) | select(length > 0) | join(",")' <<<"$ECS_PRIVATE_SUBNET_IDS")" || {
-            echo "::error::ECS_PRIVATE_SUBNET_IDS must be a JSON array of subnet ids."
-            exit 1
-          }
-
-          {
-            echo "service_name=${service_name}"
-            echo "container_name=${container_name}"
-            echo "family=${family}"
-            echo "migrate_family=${migrate_family}"
-            echo "security_group=${security_group}"
-            echo "log_group=${log_group}"
-            echo "subnets=${subnets}"
-            # <registry>/<repository> -> <repository>
-            echo "repository=${repository_url#*/}"
-            echo "image=${repository_url}:${TAG}"
-            echo "expected_digest=$(jq -r --arg s "$SERVICE" '.[$s] // ""' <<<"$DIGESTS")"
-          } >> "$GITHUB_OUTPUT"
+          exit "$missing"
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: deploy-${{ inputs.environment }}-${{ matrix.service }}-${{ github.run_id }}
+          role-session-name: deploy-${{ inputs.environment }}-${{ github.run_id }}
+
+      # The services of the environment, in the order they are deployed. The
+      # file written here is what every later step reads.
+      - name: Read what to deploy
+        id: cfg
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+          descriptor="${RUNNER_TEMP}/deploy.json"
+
+          if ! aws ssm get-parameter --name "$DEPLOY_PARAMETER" --query Parameter.Value --output text > "$descriptor"; then
+            echo "::error::${DEPLOY_PARAMETER} could not be read. Terraform creates it with the environment (infra/terraform/README.md)."
+            exit 1
+          fi
+
+          # The value comes from outside this repository: check its shape
+          # before anything in it is used.
+          if ! jq -e '
+            def id: type == "string" and test("^[A-Za-z0-9_./:-]+$");
+            (.cluster | id) and (.repository | id) and (.repository_url | id) and (.container | id) and
+            (.subnets | type == "array" and length > 0 and all(.[]; id)) and
+            (.migrate | type == "object" and
+              (.task_definition_family | id) and (.security_group_id | id) and (.log_group | id)) and
+            (.services | type == "array" and length > 0 and
+              all(.[];
+                (.name | id) and (.service | id) and (.task_definition_family | id) and
+                (.modules | type == "string" and test("^[a-z0-9_]+(,[a-z0-9_]+)*$")))) and
+            ([.services[].name] | unique | length) == (.services | length)
+          ' "$descriptor" > /dev/null; then
+            echo "::error::${DEPLOY_PARAMETER} is not a valid deploy descriptor."
+            exit 1
+          fi
+
+          {
+            echo "cluster=$(jq -r .cluster "$descriptor")"
+            echo "container=$(jq -r .container "$descriptor")"
+            echo "repository=$(jq -r .repository "$descriptor")"
+            echo "image=$(jq -r .repository_url "$descriptor"):${TAG}"
+            echo "subnets=$(jq -r '.subnets | join(",")' "$descriptor")"
+            echo "migrate_family=$(jq -r .migrate.task_definition_family "$descriptor")"
+            echo "migrate_security_group=$(jq -r .migrate.security_group_id "$descriptor")"
+            echo "migrate_log_group=$(jq -r .migrate.log_group "$descriptor")"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Deployment to ${ENVIRONMENT}"
+            echo
+            echo "Tag \`${TAG}\`. Services, in the order they are deployed:"
+            echo
+            echo "| | Service | Modules it serves |"
+            echo "|---:|---|---|"
+            jq -r '.services | to_entries[] | "| \(.key + 1) | `\(.value.service)` | `\(.value.modules)` |"' "$descriptor"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Promotion never rebuilds. The tag must already exist in the registry of
       # this environment and, when the build reported a digest, be that image.
@@ -143,7 +159,7 @@ jobs:
         env:
           REPOSITORY: ${{ steps.cfg.outputs.repository }}
           IMAGE: ${{ steps.cfg.outputs.image }}
-          EXPECTED_DIGEST: ${{ steps.cfg.outputs.expected_digest }}
+          EXPECTED_DIGEST: ${{ inputs.digest }}
         run: |
           set -euo pipefail
           if ! digest="$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=${TAG}" \
@@ -162,16 +178,18 @@ jobs:
       # A new revision is the latest one of the family with a different image.
       # Everything else (roles, variables, secrets, sizes, tags) is kept, so a
       # change that Terraform made to the family reaches the service here.
+      # Nothing is deployed yet: registering a revision changes no service.
       - name: Register the task definitions
         id: register
         env:
-          CONTAINER_NAME: ${{ steps.cfg.outputs.container_name }}
-          FAMILY: ${{ steps.cfg.outputs.family }}
+          CONTAINER_NAME: ${{ steps.cfg.outputs.container }}
           MIGRATE_FAMILY: ${{ steps.cfg.outputs.migrate_family }}
           IMAGE: ${{ steps.cfg.outputs.image }}
         run: |
           set -euo pipefail
           shopt -s inherit_errexit
+          descriptor="${RUNNER_TEMP}/deploy.json"
+          revisions="${RUNNER_TEMP}/revisions.json"
 
           register() {
             local family="$1" current next
@@ -200,30 +218,36 @@ jobs:
 
           migrate_arn="$(register "$MIGRATE_FAMILY")"
           echo "Registered ${migrate_arn}"
-          service_arn="$(register "$FAMILY")"
-          echo "Registered ${service_arn}"
-          {
-            echo "migrate=${migrate_arn}"
-            echo "service=${service_arn}"
-          } >> "$GITHUB_OUTPUT"
+          echo "migrate=${migrate_arn}" >> "$GITHUB_OUTPUT"
 
-      # The migration task is the only one that receives the credentials of the
-      # schema owner. It runs to completion before the service is touched: if
-      # it fails, the service keeps running the previous revision.
+          # Service name => the revision it will be moved to.
+          echo '{}' > "$revisions"
+          while IFS=$'\t' read -r -u 3 name family; do
+            arn="$(register "$family")"
+            echo "Registered ${arn}"
+            jq --arg n "$name" --arg a "$arn" '.[$n] = $a' "$revisions" > "${revisions}.tmp"
+            mv "${revisions}.tmp" "$revisions"
+          done 3< <(jq -r '.services[] | [.name, .task_definition_family] | @tsv' "$descriptor")
+
+      # One task migrates the schema of every module; it is the only one that
+      # receives the credentials of the schema owners. It runs to completion
+      # before any service is touched: if it fails, every service keeps
+      # running the previous revision.
       - name: Run the schema migrations
         env:
+          CLUSTER: ${{ steps.cfg.outputs.cluster }}
           TASK_DEFINITION: ${{ steps.register.outputs.migrate }}
-          CONTAINER_NAME: ${{ steps.cfg.outputs.container_name }}
+          CONTAINER_NAME: ${{ steps.cfg.outputs.container }}
           SUBNETS: ${{ steps.cfg.outputs.subnets }}
-          SECURITY_GROUP: ${{ steps.cfg.outputs.security_group }}
-          LOG_GROUP: ${{ steps.cfg.outputs.log_group }}
+          SECURITY_GROUP: ${{ steps.cfg.outputs.migrate_security_group }}
+          LOG_GROUP: ${{ steps.cfg.outputs.migrate_log_group }}
         run: |
           set -euo pipefail
           run_json="${RUNNER_TEMP}/run-task.json"
           task_json="${RUNNER_TEMP}/task.json"
 
           aws ecs run-task \
-            --cluster "$ECS_CLUSTER" \
+            --cluster "$CLUSTER" \
             --task-definition "$TASK_DEFINITION" \
             --launch-type FARGATE \
             --count 1 \
@@ -240,7 +264,7 @@ jobs:
 
           deadline=$(( $(date +%s) + MIGRATION_TIMEOUT_MINUTES * 60 ))
           while :; do
-            status="$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" \
+            status="$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
               --query 'tasks[0].lastStatus' --output text)"
             if [ "$status" = "STOPPED" ]; then
               break
@@ -253,7 +277,7 @@ jobs:
             sleep 10
           done
 
-          aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" --output json > "$task_json"
+          aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" --output json > "$task_json"
           # exitCode is absent when the container never started (image pull or
           # secret errors); that is a failure too.
           exit_code="$(jq -r --arg c "$CONTAINER_NAME" \
@@ -271,30 +295,33 @@ jobs:
           echo "::endgroup::"
 
           if [ "$exit_code" != "0" ]; then
-            echo "::error::The migration task failed (exit code: ${exit_code}; ${stopped_reason}). The service was not updated."
+            echo "::error::The migration task failed (exit code: ${exit_code}; ${stopped_reason}). No service was updated."
             exit 1
           fi
           echo "Migrations applied (exit code 0)."
 
       # The services have the deployment circuit breaker with rollback: when
       # the new tasks do not become healthy, ECS returns to the previous
-      # revision by itself. This step follows the deployment it started and
-      # fails when that deployment does not complete, so a rollback is never
-      # reported as a successful release.
-      - name: Update the service and wait for the rollout
+      # revision by itself. This step follows every deployment it starts and
+      # stops at the first one that does not complete, so a rollback is never
+      # reported as a successful release and the services after it keep the
+      # revision they had.
+      #
+      # The order is the one of the parameter. The nucleo comes last because
+      # it is the one that can STOP serving a module: it must not do so before
+      # the service that takes the module over is running this release.
+      - name: Roll the services
+        id: roll
         env:
-          SERVICE_NAME: ${{ steps.cfg.outputs.service_name }}
-          TASK_DEFINITION: ${{ steps.register.outputs.service }}
+          CLUSTER: ${{ steps.cfg.outputs.cluster }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
+          descriptor="${RUNNER_TEMP}/deploy.json"
+          revisions="${RUNNER_TEMP}/revisions.json"
           service_json="${RUNNER_TEMP}/service.json"
-
-          deployment_id="$(aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$SERVICE_NAME" \
-            --task-definition "$TASK_DEFINITION" \
-            --query "service.deployments[?status=='PRIMARY'] | [0].id" --output text)"
-          echo "Deployment: ${deployment_id}"
+          rolled_file="${RUNNER_TEMP}/rolled.txt"
+          : > "$rolled_file"
 
           events() {
             echo "::group::Last events of the service"
@@ -302,50 +329,104 @@ jobs:
             echo "::endgroup::"
           }
 
-          deadline=$(( $(date +%s) + ROLLOUT_TIMEOUT_MINUTES * 60 ))
-          while :; do
-            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$SERVICE_NAME" --output json > "$service_json"
-            state="$(jq -r --arg id "$deployment_id" \
-              '[.services[0].deployments[] | select(.id == $id)][0]
-               | if . == null then "GONE" else "\(.rolloutState // "UNKNOWN") \(.runningCount)/\(.desiredCount)" end' "$service_json")"
-            echo "  ${state}"
+          not_reached() {
+            local pending
+            pending="$(jq -r --rawfile rolled "$rolled_file" --arg current "$1" '
+              ($rolled | split("\n")) as $d
+              | [.services[].name | select(. != $current and (. as $n | $d | index($n) | not))] | join(", ")' "$descriptor")"
+            if [ -n "$pending" ]; then
+              echo "::warning::Not deployed, still on their previous revision: ${pending}."
+            fi
+          }
 
-            case "$state" in
-              COMPLETED*)
-                break
-                ;;
-              FAILED*)
-                events
-                echo "::error::The deployment failed and ECS is rolling the service back to the previous revision."
-                exit 1
-                ;;
-              GONE)
-                events
-                echo "::error::The deployment is no longer active: it was rolled back or replaced by another one."
-                exit 1
-                ;;
-            esac
+          # Called as the condition of an `if`, where `set -e` does not apply:
+          # every command that can fail returns explicitly.
+          roll() {
+            local name="$1" service="$2" modules="$3" task_definition deployment_id deadline state
+            task_definition="$(jq -er --arg n "$name" '.[$n]' "$revisions")" || return 1
 
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              events
-              echo "::error::The deployment did not complete in ${ROLLOUT_TIMEOUT_MINUTES} minutes."
+            echo "::group::${name} (modules: ${modules})"
+            deployment_id="$(aws ecs update-service \
+              --cluster "$CLUSTER" \
+              --service "$service" \
+              --task-definition "$task_definition" \
+              --query "service.deployments[?status=='PRIMARY'] | [0].id" --output text)" || {
+              echo "::endgroup::"
+              echo "::error::The service ${service} could not be updated."
+              return 1
+            }
+            echo "Deployment: ${deployment_id}"
+
+            deadline=$(( $(date +%s) + ROLLOUT_TIMEOUT_MINUTES * 60 ))
+            while :; do
+              aws ecs describe-services --cluster "$CLUSTER" --services "$service" --output json > "$service_json" || {
+                echo "::endgroup::"
+                echo "::error::The service ${service} could not be read."
+                return 1
+              }
+              state="$(jq -r --arg id "$deployment_id" \
+                '[.services[0].deployments[] | select(.id == $id)][0]
+                 | if . == null then "GONE" else "\(.rolloutState // "UNKNOWN") \(.runningCount)/\(.desiredCount)" end' "$service_json")"
+              echo "  ${state}"
+
+              case "$state" in
+                COMPLETED*)
+                  echo "::endgroup::"
+                  return 0
+                  ;;
+                FAILED*)
+                  echo "::endgroup::"
+                  events
+                  echo "::error::The deployment of ${name} failed and ECS is rolling it back to the previous revision."
+                  return 1
+                  ;;
+                GONE)
+                  echo "::endgroup::"
+                  events
+                  echo "::error::The deployment of ${name} is no longer active: it was rolled back or replaced by another one."
+                  return 1
+                  ;;
+              esac
+
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::endgroup::"
+                events
+                echo "::error::The deployment of ${name} did not complete in ${ROLLOUT_TIMEOUT_MINUTES} minutes."
+                return 1
+              fi
+              sleep 15
+            done
+          }
+
+          while IFS=$'\t' read -r -u 3 name service modules; do
+            if ! roll "$name" "$service" "$modules"; then
+              not_reached "$name"
               exit 1
             fi
-            sleep 15
-          done
+            echo "$name" >> "$rolled_file"
+          done 3< <(jq -r '.services[] | [.name, .service, .modules] | @tsv' "$descriptor")
+
+      # What a service created later starts with (a module that is promoted
+      # next month must run this release, not the image of the first day).
+      # Written only when every service completed its rollout.
+      - name: Record the release
+        run: |
+          set -euo pipefail
+          aws ssm put-parameter --name "$RELEASE_PARAMETER" --type String --value "$TAG" --overwrite > /dev/null
+          echo "${RELEASE_PARAMETER} = ${TAG}"
 
       - name: Summary
         env:
           IMAGE: ${{ steps.cfg.outputs.image }}
           DIGEST: ${{ steps.image.outputs.digest }}
-          TASK_DEFINITION: ${{ steps.register.outputs.service }}
           MIGRATE_TASK_DEFINITION: ${{ steps.register.outputs.migrate }}
         run: |
+          set -euo pipefail
           {
-            echo "### ${SERVICE} in ${ENVIRONMENT}"
             echo
             echo "- Image: \`${IMAGE}\`"
             echo "- Digest: \`${DIGEST}\`"
-            echo "- Service task definition: \`${TASK_DEFINITION}\`"
             echo "- Migration task definition: \`${MIGRATE_TASK_DEFINITION}\`"
+            jq -r 'to_entries[] | "- Task definition of `\(.key)`: `\(.value)`"' "${RUNNER_TEMP}/revisions.json"
+            echo "- Release recorded in \`${RELEASE_PARAMETER}\`"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,7 +1,8 @@
 # Checks of the infrastructure code. This workflow never changes anything in
-# AWS: it formats, validates, lints, scans, tests against mocked providers and,
-# on pull requests, shows a read-only plan per environment. Applying is done by
-# a person, outside GitHub Actions.
+# AWS: it formats, validates, lints, scans, tests against mocked providers,
+# rehearses the promotion of a module against an emulator and, on pull
+# requests, shows a read-only plan per environment. Applying is done by a
+# person, outside GitHub Actions.
 name: terraform
 
 on:
@@ -10,12 +11,14 @@ on:
       - infra/terraform/**
       # Embedded by Terraform in the database bootstrap task definition.
       - deploy/db/bootstrap-service.sql
+      - scripts/tf-ensayo-promocion.sh
       - .github/workflows/terraform.yml
   push:
     branches: [main]
     paths:
       - infra/terraform/**
       - deploy/db/bootstrap-service.sql
+      - scripts/tf-ensayo-promocion.sh
       - .github/workflows/terraform.yml
   workflow_dispatch:
 
@@ -176,6 +179,39 @@ jobs:
 
       - name: terraform test
         run: terraform test -no-color
+
+      # The same assertions with the example that gives giftcards a service of
+      # its own: they are written against the variables, so they hold for
+      # whatever topology the variables ask for.
+      - name: terraform test, with the example promotion
+        if: startsWith(matrix.dir, 'envs/')
+        run: terraform test -no-color -var-file=promocion-giftcards.tfvars
+
+  # ---------------------------------------------------------------------------
+  # The promotion of a module and the way back, stage by stage: every stage is
+  # planned by the REAL AWS provider and applied to a throwaway emulator that
+  # the script starts and removes. No credentials and no AWS account. The
+  # script fails when a plan is not the expected one (for example, when the
+  # listener rule of the module would be replaced instead of changed in place).
+  # What this shows and what it does not is at the top of the script.
+  # ---------------------------------------------------------------------------
+  rehearsal:
+    name: promotion rehearsal (emulator)
+    needs: [fmt, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Rehearse the promotion and the way back
+        run: scripts/tf-ensayo-promocion.sh
 
   # ---------------------------------------------------------------------------
   # Plan per environment, on pull requests of this repository only.

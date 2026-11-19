@@ -137,18 +137,36 @@ jobs:
           fetch-depth: 0 # gitleaks reads the commits, not only the last tree
           persist-credentials: false
 
+      # gitleaks-action scans a push from the PARENT of its first commit. The
+      # first push of a repository starts at the root commit, which has no
+      # parent, and the action fails on it without scanning anything. That one
+      # push is covered by the file scan below.
+      - name: Can gitleaks read the commits of this event
+        id: range
+        env:
+          FIRST_COMMIT: ${{ github.event.commits[0].id }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ -n "$FIRST_COMMIT" ] &&
+            ! git rev-parse --verify --quiet "${FIRST_COMMIT}^" > /dev/null; then
+            echo "::notice::This push starts at the first commit of the repository: its files are scanned instead of its commits."
+            echo "scannable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "scannable=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: gitleaks (commit history)
-        if: needs.config.outputs.gitleaks == 'true'
+        if: needs.config.outputs.gitleaks == 'true' && steps.range.outputs.scannable == 'true'
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
           GITLEAKS_ENABLE_COMMENTS: "false" # commenting would need write access to pull requests
 
-      # Without the gitleaks license of an organization, the files of the
-      # commit are still scanned. This does not look at earlier commits.
+      # Without the gitleaks license of an organization, or on the first push
+      # of a repository, the files of the commit are still scanned. This does
+      # not look at earlier commits.
       - name: Trivy secret scan (files of this commit)
-        if: needs.config.outputs.gitleaks != 'true'
+        if: needs.config.outputs.gitleaks != 'true' || steps.range.outputs.scannable != 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
