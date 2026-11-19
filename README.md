@@ -214,8 +214,21 @@ make demo-escalado       # el mismo lote con 1, 2 y 4 réplicas de giftcards; lo
 make demo-autoescalado   # SIMULACIÓN de la política sobre la cola real
 ```
 
-<!-- escalado:inicio -->
-<!-- escalado:fin -->
+**Mediciones disponibles, y por qué todavía no son una tabla de referencia.** El 19 de noviembre
+de 2026 se midió un lote de 4 000 gift cards (16 fragmentos de 250), con `lotes` siempre en 2
+réplicas y cada réplica de `giftcards` limitada a 1 vCPU:
+
+| Réplicas de giftcards | Tiempo | Gift cards/s | Condición de la corrida |
+|---:|---:|---:|---|
+| 1 | 146,5 s | 27 | limpia, con calentamiento previo |
+| 2 | 123 s | 33 | una de las dos réplicas recién arrancada, sin calentamiento |
+| 4 | 82,7 s | 48 | corrida con esperas no explicadas en el paso anterior; dato poco fiable |
+
+Las tres se hicieron en un portátil **con batería (≈12 %) y en perfil de bajo consumo**, en
+condiciones distintas entre sí. Muestran que más réplicas de `giftcards` drenan la misma cola
+más rápido sin tocar `lotes`, pero **no son comparables entre sí ni representan la aceleración
+esperable**. Para obtener la tabla válida basta repetir `make demo-escalado` con el equipo
+conectado a la corriente; el guion imprime la tabla lista para pegar aquí.
 
 Qué es real y qué no en estas demos, cómo se calibra el objetivo de *backlog* y por qué el
 escalado en AWS está validado por plan y no observado: [`docs/autoescalado.md`](docs/autoescalado.md).

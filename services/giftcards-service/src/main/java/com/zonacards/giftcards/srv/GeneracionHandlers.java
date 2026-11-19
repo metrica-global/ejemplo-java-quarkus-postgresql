@@ -166,7 +166,9 @@ public final class GeneracionHandlers {
       context.once(() -> guardar(plan, command, cards));
     } catch (GeneracionImposible | IllegalArgumentException e) {
       // Nothing of this fragment was stored: the transaction above rolled back.
-      context.once(() -> fallar(plan, command, e.getMessage()));
+      // The reason is part of the event contract, so it is never left empty.
+      String motivo = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+      context.once(() -> fallar(plan, command, motivo));
     }
   }
 
