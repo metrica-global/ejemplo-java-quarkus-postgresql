@@ -1,0 +1,10 @@
+# Copy to backend.hcl (not committed) and initialise with:
+#
+#   terraform init -backend-config=backend.hcl
+#
+# The bucket is created by ../../bootstrap (output `state_bucket_name`).
+# 123456789012 is a placeholder account id.
+
+bucket = "zonacards-tfstate-123456789012-us-east-1"
+key    = "zonacards/dev/terraform.tfstate"
+region = "us-east-1"

@@ -1,0 +1,2 @@
+# Backend settings with the real state bucket name (it contains the account id).
+backend.hcl
