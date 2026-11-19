@@ -214,21 +214,27 @@ make demo-escalado       # el mismo lote con 1, 2 y 4 réplicas de giftcards; lo
 make demo-autoescalado   # SIMULACIÓN de la política sobre la cola real
 ```
 
-**Mediciones disponibles, y por qué todavía no son una tabla de referencia.** El 19 de noviembre
-de 2026 se midió un lote de 4 000 gift cards (16 fragmentos de 250), con `lotes` siempre en 2
-réplicas y cada réplica de `giftcards` limitada a 1 vCPU:
+Resultado de `make demo-escalado` del 19 de noviembre de 2026 (lote de 4 000 gift cards en 16
+fragmentos; cada réplica de `giftcards` limitada a 1 vCPU):
 
-| Réplicas de giftcards | Tiempo | Gift cards/s | Condición de la corrida |
-|---:|---:|---:|---|
-| 1 | 146,5 s | 27 | limpia, con calentamiento previo |
-| 2 | 123 s | 33 | una de las dos réplicas recién arrancada, sin calentamiento |
-| 4 | 82,7 s | 48 | corrida con esperas no explicadas en el paso anterior; dato poco fiable |
+| Réplicas de giftcards | Réplicas de lotes | Tiempo (s) | Gift cards/s | Aceleración | Fragmentos por réplica |
+|---:|---:|---:|---:|---:|---|
+| 1 | 2 | 226,5 | 18 | 1,00x | 16 |
+| 2 | 2 | 137,0 | 29 | 1,65x | 8 + 8 |
+| 4 | 2 | 125,8 | 32 | 1,80x | 4 + 4 + 4 + 4 |
 
-Las tres se hicieron en un portátil **con batería (≈12 %) y en perfil de bajo consumo**, en
-condiciones distintas entre sí. Muestran que más réplicas de `giftcards` drenan la misma cola
-más rápido sin tocar `lotes`, pero **no son comparables entre sí ni representan la aceleración
-esperable**. Para obtener la tabla válida basta repetir `make demo-escalado` con el equipo
-conectado a la corriente; el guion imprime la tabla lista para pegar aquí.
+Cómo leerlo, sin adornos:
+
+- **Lo que depende del diseño se cumple exactamente**: el trabajo se reparte por igual entre las
+  réplicas de `giftcards` (última columna), cada una trabaja al 100 % de su vCPU, no se pierde ni
+  se duplica ningún fragmento y `lotes` no cambia.
+- **La aceleración queda lejos de la lineal porque el límite es el equipo, no el sistema.** Se
+  midió en un portátil de núcleos híbridos que estaba en su tope térmico (100 °C). Una prueba de
+  CPU pura, ajena a la aplicación, dio en ese mismo equipo entre el 48 % y el 98 % del rendimiento
+  por proceso al correr cuatro a la vez. Corridas anteriores del mismo guion, con el equipo más
+  frío, dieron 127 s y 71 s para 1 y 2 réplicas (1,78x).
+- En Fargate cada tarea recibe su propia asignación de CPU en hosts distintos. La cifra local
+  demuestra el mecanismo; el dimensionamiento debe medirse allí.
 
 Qué es real y qué no en estas demos, cómo se calibra el objetivo de *backlog* y por qué el
 escalado en AWS está validado por plan y no observado: [`docs/autoescalado.md`](docs/autoescalado.md).
@@ -300,6 +306,7 @@ respalda cada afirmación:
 | `terraform apply` en AWS | **No ejecutado** | decisión: no se crean recursos en la cuenta |
 | Autoescalado real en ECS | **No observado** | definido y probado a nivel de plan; en local se simula el controlador |
 | Workflows de GitHub Actions | **Validados estáticamente** | el repositorio no se ha publicado, así que no han corrido |
+| Demo de escalado local (`make demo-escalado`) | **Ejecutado** | reparto exacto del trabajo entre réplicas; aceleración limitada por el equipo de prueba |
 | Prueba de carga y dimensionamiento | **No ejecutado** | el objetivo de *backlog* por tarea debe calibrarse en Fargate |
 
 Limitaciones conocidas del entorno local: el emulador entrega mensajes a una conexión de

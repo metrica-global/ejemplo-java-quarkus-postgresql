@@ -20,6 +20,7 @@ REPLICAS=("$@")
 INICIALES="$(replicas giftcards)"
 LOTES_ANTES="$(replicas lotes)"
 FRAGMENTO="$(docker compose exec -T giftcards printenv ZC_GIFTCARDS_FRAGMENT_SIZE)"
+ARGON2="m=$(docker compose exec -T giftcards printenv ZC_GIFTCARDS_ARGON2_MEMORY_KIB) KiB, t=$(docker compose exec -T giftcards printenv ZC_GIFTCARDS_ARGON2_ITERATIONS)"
 trap 'escalar giftcards "$INICIALES"' EXIT
 
 echo "Lote de $CANTIDAD gift cards ($((CANTIDAD / FRAGMENTO)) fragmentos de $FRAGMENTO). lotes: $LOTES_ANTES réplicas, sin cambios."
@@ -34,19 +35,24 @@ for n in "${REPLICAS[@]}"; do
   # measurement. Without it the first run mostly measures the JIT compiler.
   cronometrar_lote "$token" "$(solicitar_lote "$token" $((FRAGMENTO * 2 * n)) "Calentamiento ($n réplicas)")" 600 >/dev/null
 
+  desde="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   id="$(solicitar_lote "$token" "$CANTIDAD" "Medición con $n réplicas")"
   segundos="$(cronometrar_lote "$token" "$id" 1800)"
   [ -n "$base" ] || base="$segundos"
-  fila="$(awk -v n="$n" -v l="$(replicas lotes)" -v s="$segundos" -v c="$CANTIDAD" -v b="$base" \
-    'BEGIN { printf "| %d | %d | %.1f | %.0f | %.2fx |", n, l, s, c / s, b / s }')"
+  # Which replica stored each fragment, from the services' own logs: how the work was shared.
+  reparto="$(docker compose logs giftcards --no-log-prefix --since "$desde" 2>/dev/null |
+    jq -Rr --arg id "$id" 'fromjson? | select(.message == "fragmento generado" and .mdc.lote_id == $id) | .hostName' |
+    sort | uniq -c | awk '{ printf "%s%s", (NR > 1 ? " + " : ""), $1 }')"
+  fila="$(awk -v n="$n" -v l="$(replicas lotes)" -v s="$segundos" -v c="$CANTIDAD" -v b="$base" -v r="$reparto" \
+    'BEGIN { printf "| %d | %d | %.1f | %.0f | %.2fx | %s |", n, l, s, c / s, b / s, r }')"
   filas+=("$fila")
-  echo "  giftcards=$n  ->  ${segundos}s"
+  echo "  giftcards=$n  ->  ${segundos}s   (fragmentos por réplica: $reparto)"
   [ "$(replicas lotes)" = "$LOTES_ANTES" ] || morir "lotes cambió de tamaño durante la medición"
 done
 
 echo
-echo "| Réplicas de giftcards | Réplicas de lotes | Tiempo (s) | Gift cards/s | Aceleración |"
-echo "|---:|---:|---:|---:|---:|"
+echo "| Réplicas de giftcards | Réplicas de lotes | Tiempo (s) | Gift cards/s | Aceleración | Fragmentos por réplica |"
+echo "|---:|---:|---:|---:|---:|---|"
 printf '%s\n' "${filas[@]}"
 echo
-echo "Medido el $(date -u +%Y-%m-%dT%H:%MZ) en $(nproc) núcleos; cada réplica de giftcards limitada a 1 vCPU."
+echo "Medido el $(date -u +%Y-%m-%dT%H:%MZ) en $(nproc) núcleos; cada réplica de giftcards limitada a 1 vCPU; Argon2id $ARGON2."

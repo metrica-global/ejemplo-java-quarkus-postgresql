@@ -121,11 +121,35 @@ Todo lo que imprime está medido en esa corrida. Cada réplica de `giftcards` es
 1 vCPU; `lotes` conserva sus réplicas y el guion falla si cambian. Antes de cada medición corre
 un lote de calentamiento, para no medir al compilador JIT.
 
-Cómo leer el resultado: en un solo equipo las réplicas comparten caché, ancho de banda de
-memoria y presupuesto térmico. Argon2id usa 19 MiB por hash a propósito, así que varias réplicas
-compiten por la caché del procesador y la aceleración local queda por debajo de la lineal. En
-Fargate cada tarea tiene su propia asignación de CPU; la cifra local es un piso, no una
-predicción.
+La última columna dice cuántos fragmentos guardó cada réplica, tomada de los logs de los
+propios servicios: es el reparto real del trabajo.
+
+Corrida del 19 de noviembre de 2026 (Argon2id `m=19456 KiB, t=2`, la configuración por defecto):
+
+| Réplicas de giftcards | Réplicas de lotes | Tiempo (s) | Gift cards/s | Aceleración | Fragmentos por réplica |
+|---:|---:|---:|---:|---:|---|
+| 1 | 2 | 226,5 | 18 | 1,00x | 16 |
+| 2 | 2 | 137,0 | 29 | 1,65x | 8 + 8 |
+| 4 | 2 | 125,8 | 32 | 1,80x | 4 + 4 + 4 + 4 |
+
+**Qué demuestra y qué no.** El reparto es exacto y, medido aparte con `docker stats`, las cuatro
+réplicas estuvieron al 100 % de su vCPU durante toda la corrida: el sistema usa toda la
+capacidad que se le da. Lo que no hay en un solo equipo es cuatro veces más capacidad:
+
+- El portátil de la prueba (Intel Core Ultra 7 155H) tiene núcleos de dos velocidades y estaba
+  en su tope térmico (100 °C). En una prueba de CPU pura (`openssl speed sha256`), sin relación
+  con la aplicación, cada proceso rindió entre el 48 % y el 98 % de lo que rinde uno solo cuando
+  corrían cuatro a la vez: el hardware ya entrega solo unas 2,7 veces más con cuatro procesos.
+- El hash es costoso en memoria a propósito, así que las réplicas compiten además por la caché
+  y el ancho de banda de memoria. Se repitió la medición con la configuración equivalente de
+  menor memoria que lista OWASP (`m=7168 KiB, t=5`) y la aceleración fue similar (1,15x y 1,55x),
+  lo que indica que la memoria no es el factor principal.
+- Los tiempos absolutos variaron mucho con la temperatura: el mismo guion dio 127 s y 71 s para
+  1 y 2 réplicas (1,78x) media hora antes.
+
+En Fargate cada tarea tiene su propia asignación de CPU en hosts distintos; la cifra local
+muestra el mecanismo y es un piso, no una predicción. El costo del hash se puede cambiar en
+local con `ZC_GIFTCARDS_ARGON2_MEMORY_KIB` y `ZC_GIFTCARDS_ARGON2_ITERATIONS`.
 
 ### 2. Ver el ciclo completo de la política, simulado
 
@@ -143,6 +167,37 @@ mínimo y el máximo) y cambia las réplicas de `giftcards` con docker compose.
 | La cola, su *backlog* y los mensajes | El controlador (lo hace un guion, no AWS) |
 | Las réplicas que arrancan, toman trabajo y se retiran | Los tiempos: evalúa cada 5 s y no cada 60; enfría 10 s y 30 s en lugar de 60 s y 300 s |
 | El tiempo que tarda el lote | La fórmula exacta de AWS, que no es pública: se usa la regla proporcional documentada |
+
+Una corrida del 19 de noviembre de 2026 (`ZC_SIM_MAX=4 scripts/demo-autoescalado.sh 6000`,
+abreviada):
+
+```
+ t (s)  en espera  en vuelo  giftcards  backlog/tarea  lotes      decisión
+     0          0         0          2            0.0  2          -
+     5         20         4          2           10.0  2          escalar a 4
+    17         14         8          4            3.5  2          -
+    28         11         8          4            2.8  2          (esperando para reducir)
+    58          7         8          4            1.8  2          reducir a 2
+   115          2         6          2            1.0  2          -
+   137          2         4          2            1.0  2          -
+   193          0         0          2            0.0  2          -
+        -> lote GENERADO a los 193s
+Lote generado en 193s. giftcards volvió a 2 réplicas; lotes tuvo 2 en todo momento.
+```
+
+Lo que enseña, más allá de que el ciclo funciona:
+
+- Al llegar el lote el *backlog* por tarea (10) supera el objetivo (4) y `giftcards` pasa de 2 a
+  4 réplicas; `lotes` no se mueve.
+- Las dos réplicas retiradas en `t=58` tenían fragmentos en curso. Los que no terminaron dentro
+  del tiempo de apagado **volvieron a la cola al vencer su *visibility timeout*** (reaparecen
+  como "en espera" en `t=137`) y los completaron las réplicas restantes. Nada se perdió ni se
+  duplicó: el lote terminó con sus 6 000 gift cards.
+- La simulación redujo réplicas con trabajo aún pendiente porque **solo modela la política de
+  *backlog***. En AWS hay además una política de CPU, y Application Auto Scaling retira tareas
+  solo cuando **todas** las políticas lo permiten: con las tareas al 100 % de CPU no reduciría
+  todavía. Es también un recordatorio de que el objetivo de *backlog* y los tiempos de
+  enfriamiento se calibran con mediciones reales.
 
 ### Una particularidad del emulador
 

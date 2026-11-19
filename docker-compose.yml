@@ -202,6 +202,10 @@ services:
       # Smaller fragments and a shorter visibility timeout than in AWS, so a demo on a laptop
       # shows progress, and a killed task is taken over, in seconds instead of minutes.
       ZC_GIFTCARDS_FRAGMENT_SIZE: ${ZC_GIFTCARDS_FRAGMENT_SIZE:-250}
+      # Cost of the CVV hash (Argon2id). The defaults are the production ones; they can be
+      # changed here to compare configurations (see docs/autoescalado.md).
+      ZC_GIFTCARDS_ARGON2_MEMORY_KIB: ${ZC_GIFTCARDS_ARGON2_MEMORY_KIB:-19456}
+      ZC_GIFTCARDS_ARGON2_ITERATIONS: ${ZC_GIFTCARDS_ARGON2_ITERATIONS:-2}
       ZC_GIFTCARDS_GENERACION_VISIBILITY: PT30S
     healthcheck: *service-healthcheck
     stop_grace_period: 90s

@@ -386,6 +386,22 @@ No validado, y pendiente de la primera ejecución real:
 - Los jobs de SonarQube y Snyk: dependen de un servidor y de cuentas que este repositorio no
   tiene.
 
+### Observaciones abiertas sobre la infraestructura
+
+Salieron al contrastar los workflows con `infra/terraform`. No bloquean el ejemplo, pero deben
+decidirse antes de usarlo con una cuenta real:
+
+| Observación | Dónde | Qué hacer |
+|---|---|---|
+| El rol `plan` puede leer los secretos del ambiente desde cualquier *pull request* de una rama del repositorio | `modules/github-oidc` (confianza `pull_request`, lectura de `zonacards-<amb>-*`) | Para producción, limitar el plan a `main` o a un *environment* con revisores, o planificar producción fuera de los PR |
+| El rol `deploy` no puede detener tareas | `modules/github-oidc` (sin `ecs:StopTask`) | Si una migración supera el tiempo límite, el job falla pero la tarea sigue; añadir el permiso o detenerla a mano |
+| El rol `deploy` no puede autenticarse en ECR | `modules/github-oidc` (sin `ecr:GetAuthorizationToken`) | Necesario si se quiere verificar la firma de la imagen antes de desplegar |
+| Producción en otra cuenta no recibe las imágenes por sí sola | `modules/platform/main.tf` (registro por cuenta) | Usar el job `replicate` o la replicación de ECR entre cuentas |
+| Un cambio de Terraform en una *task definition* no llega al servicio hasta el siguiente despliegue | `modules/ecs-service` (`ignore_changes`) | Tras un `apply` que cambie variables o secretos, ejecutar `deploy.yml` a mano con la etiqueta vigente |
+| Una llave KMS propia en el bucket de estado rompería el plan | `bootstrap/main.tf` | El rol `plan` no tiene `kms:Decrypt`; con la llave administrada por AWS no hay problema |
+| No está confirmado cómo trata la política de ciclo de vida de ECR a firmas y atestaciones | `modules/ecr/main.tf` | Comprobarlo con la primera imagen firmada |
+| Dependabot probablemente no actualiza la imagen base | `Dockerfile` (la etiqueta se arma con un `ARG`) | Revisarla a mano o fijar la etiqueta completa |
+
 Dos cosas a saber antes de usarlo en un repositorio privado: la firma con `cosign` registra la
 identidad del workflow (organización, repositorio y ruta del workflow) en el registro público de
 transparencia de Sigstore; y la versión de la CLI de Snyk no está fijada (se instala la última).
