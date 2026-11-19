@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Runs a command inside the build container (JDK 25).
+#
+# The project builds with a local JDK 25 if there is one; this wrapper exists for
+# machines that only have Docker. It mounts the repository at the same absolute
+# path (required by Testcontainers when it starts sibling containers), shares the
+# Docker socket, and keeps the Maven cache in a named volume instead of $HOME.
+set -euo pipefail
+
+IMAGE="${ZC_BUILD_IMAGE:-eclipse-temurin:25-jdk}"
+VOLUME="${ZC_M2_VOLUME:-zonacards-m2}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOCK="${DOCKER_SOCK:-/var/run/docker.sock}"
+uid="$(id -u)"
+gid="$(id -g)"
+
+if ! docker volume inspect "$VOLUME" >/dev/null 2>&1; then
+  docker volume create "$VOLUME" >/dev/null
+  docker run --rm -v "$VOLUME:/m2" "$IMAGE" chown "$uid:$gid" /m2
+fi
+
+args=(
+  --rm
+  -u "$uid:$gid"
+  -v "$ROOT:$ROOT"
+  -w "$PWD"
+  -v "$VOLUME:/m2"
+  -e HOME=/m2
+  -e MAVEN_USER_HOME=/m2/.m2
+  # Every JVM in the container (Maven and the forked test JVMs) must agree on the
+  # home directory, or Quarkus looks for the local repository in the wrong place.
+  -e JAVA_TOOL_OPTIONS=-Duser.home=/m2
+  -e TESTCONTAINERS_RYUK_DISABLED
+)
+
+if [ -S "$SOCK" ]; then
+  args+=(-v "$SOCK:/var/run/docker.sock" --group-add "$(stat -c %g "$SOCK")")
+fi
+
+# Host networking lets the tests reach the ports that Testcontainers publishes.
+# On Docker Desktop use: ZC_DOCKER_NETWORK=bridge TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal
+NETWORK="${ZC_DOCKER_NETWORK:-host}"
+args+=(--network "$NETWORK")
+if [ "$NETWORK" = host ]; then
+  args+=(-e "TESTCONTAINERS_HOST_OVERRIDE=${TESTCONTAINERS_HOST_OVERRIDE:-localhost}")
+elif [ -n "${TESTCONTAINERS_HOST_OVERRIDE:-}" ]; then
+  args+=(-e "TESTCONTAINERS_HOST_OVERRIDE=$TESTCONTAINERS_HOST_OVERRIDE")
+fi
+
+if [ -t 0 ] && [ -t 1 ]; then
+  args+=(-it)
+fi
+
+exec docker run "${args[@]}" "$IMAGE" "$@"
