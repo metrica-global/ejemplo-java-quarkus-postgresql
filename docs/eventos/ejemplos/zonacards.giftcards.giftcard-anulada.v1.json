@@ -1,0 +1,16 @@
+{
+  "specversion": "1.0",
+  "id": "019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77",
+  "source": "/zonacards/giftcards",
+  "type": "zonacards.giftcards.giftcard-anulada.v1",
+  "subject": "019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52",
+  "time": "2026-11-18T15:04:05.123Z",
+  "datacontenttype": "application/json",
+  "tenantid": "pe",
+  "correlationid": "6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "data": {
+    "giftCardId": "019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52",
+    "motivo": "Reportada como extraviada"
+  }
+}

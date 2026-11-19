@@ -101,6 +101,19 @@ class DbIT {
                     SqlArray.text(List.of("b", "c", "d")),
                     SqlArray.integers(List.of(20, 30, 40))));
     assertEquals(List.of(30, 40), inserted.stream().sorted().toList());
+
+    // Binary and uuid arrays, as used to store a fragment of gift cards in one statement.
+    UUID first = UUID.randomUUID();
+    UUID second = UUID.randomUUID();
+    List<String> hex =
+        uow.inTx(
+            () ->
+                db.queryList(
+                    "SELECT t.id::text || ':' || encode(t.blob, 'hex') AS v FROM unnest(?::uuid[], ?::bytea[]) AS t(id, blob) ORDER BY 1",
+                    row -> row.string("v"),
+                    SqlArray.uuid(List.of(first, second)),
+                    SqlArray.bytes(List.of(new byte[] {0x01, (byte) 0xff}, new byte[] {0x00}))));
+    assertEquals(java.util.stream.Stream.of(first + ":01ff", second + ":00").sorted().toList(), hex);
   }
 
   @Test

@@ -55,6 +55,11 @@ public final class EventSpy {
     return seen.stream().filter(received -> matches(received, type, subject)).count();
   }
 
+  /** Every matching event seen so far. */
+  public synchronized List<Received> all(String type, String subject) {
+    return seen.stream().filter(received -> matches(received, type, subject)).toList();
+  }
+
   private static boolean matches(Received received, String type, String subject) {
     return type.equals(received.event().path("type").asText()) && subject.equals(received.event().path("subject").asText());
   }

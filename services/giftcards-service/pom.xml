@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.zonacards</groupId>
+    <artifactId>zonacards-parent</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>giftcards-service</artifactId>
+  <name>Zonacards :: Service :: giftcards</name>
+  <description>The giftcards domain: issues gift cards and generates the cards of a lote. The service that scales out.</description>
+
+  <properties>
+    <test.logmanager>org.jboss.logmanager.LogManager</test.logmanager>
+  </properties>
+
+  <dependencies>
+    <!-- Internal library -->
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-errx</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-kernel</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-logx</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-ptrx</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-asyncx</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-dbx</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-eventx</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-eventx-postgres</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-eventx-aws</artifactId></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-server</artifactId></dependency>
+
+    <!-- Quarkus -->
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-arc</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-rest-jackson</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-jdbc-postgresql</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-flyway</artifactId></dependency>
+    <dependency><groupId>org.flywaydb</groupId><artifactId>flyway-database-postgresql</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-oidc</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-smallrye-health</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-micrometer-registry-prometheus</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-opentelemetry</artifactId></dependency>
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-logging-json</artifactId></dependency>
+    <dependency><groupId>io.quarkiverse.amazonservices</groupId><artifactId>quarkus-amazon-sqs</artifactId></dependency>
+    <dependency><groupId>io.quarkiverse.amazonservices</groupId><artifactId>quarkus-amazon-sns</artifactId></dependency>
+    <dependency><groupId>software.amazon.awssdk</groupId><artifactId>url-connection-client</artifactId></dependency>
+    <dependency><groupId>org.bouncycastle</groupId><artifactId>bcprov-jdk18on</artifactId></dependency>
+
+    <!-- Tests -->
+    <dependency><groupId>io.quarkus</groupId><artifactId>quarkus-junit</artifactId><scope>test</scope></dependency>
+    <dependency><groupId>io.rest-assured</groupId><artifactId>rest-assured</artifactId><scope>test</scope></dependency>
+    <dependency><groupId>org.awaitility</groupId><artifactId>awaitility</artifactId><scope>test</scope></dependency>
+    <dependency><groupId>com.zonacards</groupId><artifactId>zc-testkit</artifactId><scope>test</scope></dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>${quarkus.platform.group-id}</groupId>
+        <artifactId>quarkus-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>build</goal>
+              <goal>generate-code</goal>
+              <goal>generate-code-tests</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

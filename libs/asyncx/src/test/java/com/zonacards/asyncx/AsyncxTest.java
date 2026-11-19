@@ -122,4 +122,37 @@ class AsyncxTest {
     release.countDown();
     assertTrue(executor.awaitIdle(Duration.ofSeconds(5)));
   }
+
+  @Test
+  void theComputePoolRunsOnPlatformThreadsAndKeepsVirtualThreadsResponsive() throws Exception {
+    try (ComputePool pool = new ComputePool("cpu", 2)) {
+      assertEquals(2, pool.threads());
+      assertFalse(pool.call(() -> Thread.currentThread().isVirtual()), "CPU work must not run on a virtual thread");
+      assertTrue(pool.call(() -> Thread.currentThread().getName()).startsWith("cpu-"));
+      assertThrows(IllegalStateException.class, () -> pool.call(() -> { throw new IllegalStateException("as thrown"); }));
+
+      // A virtual thread that waits for a long computation leaves the others free to run.
+      AtomicInteger ticks = new AtomicInteger();
+      CountDownLatch release = new CountDownLatch(1);
+      Thread waiting = Thread.ofVirtual().start(() -> pool.call(() -> { release.await(); return 1; }));
+      Thread ticker =
+          Thread.ofVirtual()
+              .start(
+                  () -> {
+                    for (int i = 0; i < 20; i++) {
+                      ticks.incrementAndGet();
+                      try {
+                        Thread.sleep(2);
+                      } catch (InterruptedException e) {
+                        return;
+                      }
+                    }
+                  });
+      ticker.join(Duration.ofSeconds(5));
+      assertEquals(20, ticks.get());
+      release.countDown();
+      waiting.join(Duration.ofSeconds(5));
+    }
+    assertTrue(new ComputePool("default", 0).threads() >= 1);
+  }
 }

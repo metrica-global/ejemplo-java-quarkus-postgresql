@@ -49,6 +49,7 @@
     <module>libs/eventx-aws</module>
     <module>libs/server</module>
     <module>services/lotes-service</module>
+    <module>services/giftcards-service</module>
   </modules>
 
   <dependencyManagement>

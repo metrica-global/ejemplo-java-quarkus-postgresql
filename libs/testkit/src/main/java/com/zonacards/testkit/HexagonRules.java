@@ -32,7 +32,12 @@ import java.util.List;
 public final class HexagonRules {
 
   private static final String[] INTERNAL_LIBRARY = {
-    "java..", "com.zonacards.kernel..", "com.zonacards.errx..", "com.zonacards.logx..", "com.zonacards.ptrx.."
+    "java..",
+    "com.zonacards.kernel..",
+    "com.zonacards.errx..",
+    "com.zonacards.logx..",
+    "com.zonacards.ptrx..",
+    "com.zonacards.asyncx.."
   };
 
   private HexagonRules() {}
@@ -62,7 +67,7 @@ public final class HexagonRules {
             .should()
             .onlyDependOnClassesThat()
             .resideInAnyPackage(allow(base))
-            .as("the domain depends only on the JDK and on kernel, errx, logx and ptrx")
+            .as("the domain depends only on the JDK and on the framework-free internal library")
             .allowEmptyShould(true));
     rules.add(
         classes()
