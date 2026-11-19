@@ -17,7 +17,7 @@ puede prescindir del contenedor añadiendo `RUN=` a cualquier comando de `make`.
 | `make token` | Token de un usuario de demostración (`USUARIO=ana\|luis\|eva`) |
 | `make logs` | Logs de los dos servicios |
 | `make demo-escalado`, `make demo-autoescalado` | Ver `docs/autoescalado.md` |
-| `scripts/tf-plan.sh dev` | `terraform plan` de un ambiente con estado local desechable (nunca aplica) |
+| `AWS_PROFILE=<perfil> scripts/tf-plan.sh dev` | `terraform plan` de un ambiente contra una cuenta real, con estado local desechable (nunca aplica). `qa` y `prod` necesitan además `-var certificate_arn=<arn>` |
 
 Una prueba concreta:
 

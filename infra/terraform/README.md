@@ -185,7 +185,8 @@ Límites de esta evidencia, sin adornos:
 
 - Un proveedor simulado no ejecuta la lógica de plan del proveedor real ni consulta AWS. Estas
   pruebas demuestran qué recursos se declaran y con qué argumentos, no que AWS los acepte. Eso
-  lo cubre el `terraform plan` real, y el comportamiento del escalado solo se observa aplicando.
+  lo cubre el `terraform plan` real ([resultado](#plan-contra-una-cuenta-real)), y el
+  comportamiento del escalado solo se observa aplicando.
 - Terraform 1.16 no puede simular recursos efímeros. En las pruebas de `platform` y de los
   ambientes, `modules/generated-secrets` se reemplaza por sus salidas (`override_module`); ese
   módulo solo está cubierto por `terraform validate`.
@@ -244,6 +245,54 @@ corre tal cual. Tres de ellos son marcadores que hay que cambiar antes de aplica
 `qa` y `prod` **no planifican sin certificado**: hay que descomentar `certificate_arn` en su
 `terraform.tfvars` o pasarlo con `-var`. Es intencional, para que ninguno quede en HTTP por
 omisión.
+
+Para ver el plan de un ambiente antes de que exista el bucket de estado, sin tocar esta carpeta:
+
+```bash
+AWS_PROFILE=<perfil> scripts/tf-plan.sh dev
+AWS_PROFILE=<perfil> scripts/tf-plan.sh qa -var certificate_arn=<arn del certificado>
+```
+
+El guion planifica una copia con estado local desechable; solo lee de AWS y nunca aplica.
+
+### Plan contra una cuenta real
+
+Ejecutado el 19 de noviembre de 2026 en `us-east-1`, con Terraform 1.16.2 y el proveedor
+`aws` 6.73.0, sobre una cuenta sin recursos de Zonacards. No hizo falta cambiar ningún archivo
+de Terraform: los cuatro planes salieron sin errores ni advertencias al primer intento.
+
+| Raíz | Resultado | Autoescalado planificado |
+|---|---|---|
+| `bootstrap` | 7 por crear | no aplica |
+| `envs/dev` | 121 por crear, 0 por cambiar, 0 por destruir | `giftcards` de 2 a 10 tareas; `lotes` fijo en 2 |
+| `envs/qa` | 116 por crear | `giftcards` de 2 a 12; `lotes` fijo en 2 |
+| `envs/prod` | 140 por crear | `giftcards` de 3 a 30; `lotes` fijo en 3 |
+
+`qa` y `prod` se planificaron con un ARN de certificado de marcador (`-var certificate_arn=…`);
+sin él, el plan se rechaza con `Invalid value for variable`, como está previsto. `qa` tiene
+menos recursos que `dev` porque no crea los de nivel de cuenta.
+
+Un plan sobre un estado vacío no llama a las API de creación, así que se comprobó aparte, con
+consultas de solo lectura a la misma cuenta, lo que el plan no valida:
+
+| Comprobación | Resultado |
+|---|---|
+| PostgreSQL 18 en RDS | Disponible (18.1, 18.2, 18.3, 18.4 y 18.6); `engine_version = "18"` resuelve hoy a 18.3, con la familia `postgres18` |
+| Clases `db.t4g.medium` (`dev`, `qa`) y `db.m7g.large` (`prod`) con PostgreSQL 18 | Se pueden pedir con `gp3`, Multi-AZ y Performance Insights |
+| Parámetros `rds.force_ssl` y `max_connections` | Existen y son modificables; el primero es dinámico y el segundo estático, como los declara el módulo |
+| Política TLS del balanceador y servicio del *endpoint* de S3 | Existen en la región |
+| Políticas conocidas en el plan (7 de confianza, 2 de identidad y la de la llave KMS) | IAM Access Analyzer (`validate-policy`): sin hallazgos |
+| Las 43 acciones IAM que usan los módulos | Todas existen |
+| Nombres que el plan crearía (roles, colas, topics, secretos, alias KMS, *log groups*, RDS, balanceador, proveedor OIDC de GitHub) | Ninguno existe ya en la cuenta |
+
+Lo que sigue sin comprobarse, porque solo se sabe al aplicar:
+
+- Ocho políticas IAM en línea, tres de confianza, las dos políticas de cola y las definiciones
+  de contenedor dependen de ARN que no existen hasta crear los recursos (`known after apply`),
+  así que su JSON final no pasó por AWS. Las pruebas nativas cubren qué sentencias declaran.
+- Las cuotas de la cuenta más allá de VPC y direcciones elásticas, y los permisos de quien
+  aplique.
+- El comportamiento del escalado, que solo se observa desplegando.
 
 `create_account_level_resources` debe ser `true` en un solo ambiente por cuenta de AWS: ese
 ambiente es dueño de los repositorios ECR, del proveedor OIDC de GitHub y del rol de *build*.

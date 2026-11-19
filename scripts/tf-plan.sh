@@ -3,6 +3,9 @@
 # WITHOUT ever applying.
 #
 #   AWS_PROFILE=tf scripts/tf-plan.sh dev
+#   AWS_PROFILE=tf scripts/tf-plan.sh qa -var certificate_arn=arn:aws:acm:...   # qa and prod require it
+#
+# Anything after the environment is passed to terraform plan.
 #
 # The environments keep their state in S3. To see what Terraform would create before that bucket
 # exists, this script plans a copy of infra/terraform that uses a throwaway local state. It only
@@ -15,8 +18,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [ -d "$ROOT/infra/terraform/envs/$ENVIRONMENT" ] || { echo "ambiente desconocido: $ENVIRONMENT" >&2; exit 1; }
 [ -n "${AWS_PROFILE:-}${AWS_ACCESS_KEY_ID:-}" ] || { echo "defina AWS_PROFILE (por ejemplo AWS_PROFILE=tf)" >&2; exit 1; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/zonacards-tf-plan.XXXXXX")"
+# ZC_TF_PLAN_WORKDIR chooses where the copy goes. Do not point TMPDIR at a deep directory
+# instead: Terraform starts its providers over a Unix socket created under TMPDIR, and a socket
+# path longer than about 100 characters makes every provider fail to start.
+WORK="${ZC_TF_PLAN_WORKDIR:-$(mktemp -d "${TMPDIR:-/tmp}/zonacards-tf-plan.XXXXXX")}"
 mkdir -p "$WORK/infra" "$WORK/deploy"
+[ ! -e "$WORK/infra/terraform" ] || { echo "$WORK ya contiene un plan anterior; use un directorio nuevo" >&2; exit 1; }
 # The database module reads deploy/db/bootstrap-service.sql by a relative path.
 cp -R "$ROOT/deploy/db" "$WORK/deploy/db"
 (cd "$ROOT/infra" && tar --exclude='.terraform' --exclude='*.tfstate*' -cf - terraform) | (cd "$WORK/infra" && tar -xf -)

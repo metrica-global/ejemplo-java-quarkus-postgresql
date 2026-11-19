@@ -302,9 +302,9 @@ respalda cada afirmación:
 | Módulo Terraform de mensajería | **Aplicado contra el emulador** | 12 recursos creados; reaplicarlo no produce cambios |
 | Terraform: `fmt`, `validate` (5 raíces), 25 pruebas nativas, tflint, trivy | **Ejecutado** | sin credenciales, con proveedores simulados |
 | Contratos de eventos (AsyncAPI) | **Validado** | los 11 ejemplos cumplen su esquema |
-| `terraform plan` contra una cuenta AWS | **Pendiente** | preparado en `scripts/tf-plan.sh`; al intentarlo la sesión del perfil había expirado |
+| `terraform plan` contra una cuenta AWS real | **Ejecutado** | sin errores ni advertencias: `dev` 121 recursos, `qa` 116, `prod` 140, `bootstrap` 7; el autoescalado aparece solo en `giftcards`. Detalle y límites en [`infra/terraform/README.md`](infra/terraform/README.md#plan-contra-una-cuenta-real) |
 | `terraform apply` en AWS | **No ejecutado** | decisión: no se crean recursos en la cuenta |
-| Autoescalado real en ECS | **No observado** | definido y probado a nivel de plan; en local se simula el controlador |
+| Autoescalado real en ECS | **No observado** | definido y planificado contra una cuenta real; en local se simula el controlador |
 | Workflows de GitHub Actions | **Validados estáticamente** | el repositorio no se ha publicado, así que no han corrido |
 | Demo de escalado local (`make demo-escalado`) | **Ejecutado** | reparto exacto del trabajo entre réplicas; aceleración limitada por el equipo de prueba |
 | Prueba de carga y dimensionamiento | **No ejecutado** | el objetivo de *backlog* por tarea debe calibrarse en Fargate |

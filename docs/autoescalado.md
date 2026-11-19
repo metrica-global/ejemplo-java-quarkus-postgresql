@@ -214,8 +214,25 @@ después de reducir réplicas. Está comprobado con una prueba directa contra el
 | Que solo `giftcards` declara escalado y con qué políticas | Pruebas nativas de Terraform |
 | Que réplicas adicionales de `giftcards` toman trabajo de la misma cola sin duplicar ni perder, y que `lotes` no cambia | `make e2e escalado`, `make demo-escalado` |
 | Que una tarea que desaparece a mitad de su trabajo no pierde ni duplica nada | `make e2e caida` (`kill -9` con fragmentos en proceso) |
-| Que AWS acepta la definición | **Pendiente**: requiere `terraform plan` con credenciales |
+| Que el proveedor real de AWS acepta la definición | `terraform plan` contra una cuenta real: sin errores, y los tres recursos de escalado aparecen solo en `giftcards` (ver abajo) |
+| Que la API de AWS crea cada recurso tal como está planificado | **No ejecutado**: eso ocurre al aplicar, y no se aplicó nada |
 | El comportamiento real de la política en ECS (tiempos de reacción, oscilación) | **No observado**: requiere desplegar |
+
+Lo que muestra el plan real (19 de noviembre de 2026, `scripts/tf-plan.sh`), igual en los tres
+ambientes salvo los números:
+
+```
+module.zonacards.module.lotes.aws_ecs_service.fixed[0]                    desired_count = 2
+module.zonacards.module.giftcards.aws_ecs_service.autoscaled[0]           desired_count = 2
+module.zonacards.module.giftcards.aws_appautoscaling_target.this[0]       min 2, max 10
+module.zonacards.module.giftcards.aws_appautoscaling_policy.cpu[0]        ECSServiceAverageCPUUtilization, objetivo 60
+module.zonacards.module.giftcards.aws_appautoscaling_policy.backlog[0]    m1 / m2, objetivo 10
+    m1 = AWS/SQS  ApproximateNumberOfMessagesVisible  (cola zonacards-dev-giftcards-generacion, Sum)
+    m2 = ECS/ContainerInsights  RunningTaskCount       (servicio zonacards-dev-giftcards, Average)
+```
+
+No hay ningún recurso `aws_appautoscaling_*` bajo `module.lotes`. En `qa` el rango planificado
+es de 2 a 12 tareas y en `prod` de 3 a 30.
 
 Para observarlo en una cuenta de pruebas: aplicar `envs/dev`, solicitar un lote grande y seguir
 en CloudWatch `ApproximateNumberOfMessagesVisible` de la cola junto a `RunningTaskCount` de los
