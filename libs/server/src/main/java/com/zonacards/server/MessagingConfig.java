@@ -6,9 +6,9 @@ import java.time.Duration;
 import java.util.Map;
 
 /**
- * Messaging settings of a service. Everything can be overridden with environment variables, and
- * both loops can be switched off, which is how one image can later be deployed as separate
- * "api" and "worker" services without code changes.
+ * Messaging settings of a deployment, shared by the modules it serves. Everything can be
+ * overridden with environment variables, and both loops can be switched off, which is how a
+ * module could later be split further into "api" and "worker" deployments without code changes.
  */
 @ConfigMapping(prefix = "zonacards.messaging")
 public interface MessagingConfig {

@@ -9,7 +9,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The background loops of a service: its consumers and its outbox relay. A service has exactly
+ * The background loops of a module: its consumers and its outbox relay. A module has exactly
  * one; its container builds it and the application lifecycle starts and stops it.
  *
  * <p>Shutdown order matters. Consumers stop first and drain their in-flight messages; the relay

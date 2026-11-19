@@ -20,8 +20,8 @@ import java.util.function.Supplier;
 /**
  * Carries the trace across the broker. When an event is written to the outbox the current span
  * is stored in its {@code traceparent}; when the event is consumed, possibly minutes later and
- * in another service, a CONSUMER span is opened as a child of it. One trace then shows the HTTP
- * request, the event and everything the other domain did because of it.
+ * in another deployment, a CONSUMER span is opened as a child of it. One trace then shows the
+ * HTTP request, the event and everything the other module did because of it.
  */
 @Singleton
 public class OtelEventTracing implements TraceContext, ConsumeInterceptor {
@@ -66,6 +66,8 @@ public class OtelEventTracing implements TraceContext, ConsumeInterceptor {
             .setAttribute("messaging.operation.type", "process")
             .setAttribute("messaging.message.id", envelope.id())
             .setAttribute("messaging.consumer.group.name", consumer)
+            // The consumer is the module: the same in every deployment that serves it.
+            .setAttribute("zonacards.module", consumer)
             .setAttribute("zonacards.tenant_id", String.valueOf(envelope.tenantid()))
             .startSpan();
     try (Scope ignored = span.makeCurrent()) {

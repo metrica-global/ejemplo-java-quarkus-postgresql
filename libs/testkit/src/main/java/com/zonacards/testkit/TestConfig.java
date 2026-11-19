@@ -1,9 +1,10 @@
 package com.zonacards.testkit;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
-/** Quarkus configuration that points a service under test at the fixtures. */
+/** Quarkus configuration that points the application under test at the fixtures. */
 public final class TestConfig {
 
   public static final String AWS_ENDPOINT = "test.aws.endpoint";
@@ -11,16 +12,24 @@ public final class TestConfig {
 
   private TestConfig() {}
 
-  /** Runtime role for the pool, owner role for Flyway: the same split as in production. */
-  public static Map<String, String> database(PostgresFixture postgres, String service) {
+  /**
+   * One datasource per module, as in production: the module's runtime role for the pool and its
+   * owner role for Flyway. Only the listed modules get credentials; the others stay without,
+   * which is how a deployment that does not serve a module looks.
+   */
+  public static Map<String, String> database(PostgresFixture postgres, String... modules) {
     Map<String, String> config = new HashMap<>();
-    config.put("quarkus.datasource.jdbc.url", postgres.jdbcUrl());
-    config.put("quarkus.datasource.username", PostgresFixture.appUser(service));
-    config.put("quarkus.datasource.password", PostgresFixture.appPassword(service));
-    config.put("quarkus.flyway.jdbc-url", postgres.jdbcUrl());
-    config.put("quarkus.flyway.username", PostgresFixture.ownerUser(service));
-    config.put("quarkus.flyway.password", PostgresFixture.ownerPassword(service));
-    config.put("quarkus.flyway.migrate-at-start", "true");
+    // The same variable the deployments receive; application.properties refers to it.
+    config.put("ZC_DB_URL", postgres.jdbcUrl());
+    for (String module : modules) {
+      String upper = module.toUpperCase(Locale.ROOT);
+      config.put("ZC_DB_" + upper + "_APP_USER", PostgresFixture.appUser(module));
+      config.put("ZC_DB_" + upper + "_APP_PASSWORD", PostgresFixture.appPassword(module));
+      config.put("quarkus.flyway." + module + ".jdbc-url", postgres.jdbcUrl());
+      config.put("quarkus.flyway." + module + ".username", PostgresFixture.ownerUser(module));
+      config.put("quarkus.flyway." + module + ".password", PostgresFixture.ownerPassword(module));
+      config.put("quarkus.flyway." + module + ".migrate-at-start", "true");
+    }
     return config;
   }
 

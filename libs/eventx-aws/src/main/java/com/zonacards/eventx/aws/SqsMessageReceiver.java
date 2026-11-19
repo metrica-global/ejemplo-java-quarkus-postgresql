@@ -11,6 +11,7 @@ import java.util.Map;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.Message;
 import software.amazon.awssdk.services.sqs.model.MessageSystemAttributeName;
+import software.amazon.awssdk.services.sqs.model.QueueAttributeName;
 
 /** Consumes SQS with long polling. */
 public final class SqsMessageReceiver implements MessageReceiver {
@@ -21,6 +22,15 @@ public final class SqsMessageReceiver implements MessageReceiver {
   public SqsMessageReceiver(SqsClient sqs, Destinations destinations) {
     this.sqs = sqs;
     this.destinations = destinations;
+  }
+
+  /**
+   * Proves that the queue is configured, exists, and that this task may read it. Meant for
+   * startup: a consumer on a queue it cannot reach would retry forever while looking alive.
+   */
+  public void verify(String queue) {
+    sqs.getQueueAttributes(
+        request -> request.queueUrl(destinations.queueUrl(queue)).attributeNames(QueueAttributeName.QUEUE_ARN));
   }
 
   @Override
