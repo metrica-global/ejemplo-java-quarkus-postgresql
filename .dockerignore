@@ -1,4 +1,4 @@
-# The image is built from sources: pom files, libs/ and services/. Nothing else is needed.
+# The image is built from sources: pom files, libs/ and app/. Nothing else is needed.
 .git
 .github
 **/target

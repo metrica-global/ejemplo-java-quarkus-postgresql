@@ -3,6 +3,7 @@ package com.zonacards.server;
 import jakarta.inject.Singleton;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
@@ -16,14 +17,15 @@ public class ActiveModules {
   private final List<AppModule> known;
   private final Set<String> configured;
 
-  public ActiveModules(List<AppModule> known, @ConfigProperty(name = "zonacards.modules") List<String> configured) {
+  public ActiveModules(
+      List<AppModule> known, @ConfigProperty(name = "zonacards.modules") Optional<List<String>> configured) {
     this.known = List.copyOf(known);
-    this.configured = new LinkedHashSet<>(configured);
+    this.configured = new LinkedHashSet<>(configured.orElse(List.of()));
   }
 
   /**
-   * A misspelled name would otherwise produce a healthy task that serves nothing, so it stops
-   * the start instead.
+   * A missing list or a misspelled name would otherwise produce a healthy task that serves
+   * nothing, so they stop the start instead.
    */
   public void validate() {
     Set<String> names = new LinkedHashSet<>();
@@ -35,7 +37,8 @@ public class ActiveModules {
           "ZC_MODULES lists " + unknown + ", which this application does not contain. Its modules are " + names + ".");
     }
     if (configured.isEmpty()) {
-      throw new IllegalStateException("ZC_MODULES is empty: a deployment must serve at least one of " + names + ".");
+      throw new IllegalStateException(
+          "ZC_MODULES is not set: a deployment must say which modules it serves. This application contains " + names + ".");
     }
   }
 

@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.zonacards.eventx.EventxRuntime;
 import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 class ActiveModulesTest {
@@ -19,7 +20,7 @@ class ActiveModulesTest {
   }
 
   private static ActiveModules deployment(String... served) {
-    return new ActiveModules(List.of(LOTES, GIFTCARDS), List.of(served));
+    return new ActiveModules(List.of(LOTES, GIFTCARDS), served.length == 0 ? Optional.empty() : Optional.of(List.of(served)));
   }
 
   @Test
@@ -43,7 +44,8 @@ class ActiveModulesTest {
   @Test
   void aDeploymentThatServesNothingStopsTheStart() {
     IllegalStateException empty = assertThrows(IllegalStateException.class, () -> deployment().validate());
-    assertTrue(empty.getMessage().contains("ZC_MODULES is empty"), empty.getMessage());
+    assertTrue(empty.getMessage().contains("ZC_MODULES is not set"), empty.getMessage());
+    assertTrue(empty.getMessage().contains("[lotes, giftcards]"), empty.getMessage());
   }
 
   @Test

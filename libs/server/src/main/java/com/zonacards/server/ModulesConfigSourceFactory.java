@@ -37,9 +37,9 @@ public class ModulesConfigSourceFactory implements ConfigSourceFactory {
       ConfigValue configured = context.getValue("zonacards.modules");
       list = configured == null || configured.getValue() == null ? "" : configured.getValue();
     } catch (NoSuchElementException e) {
-      // ZC_MODULES was not given. Nothing is switched on here; the application then refuses to
-      // start when it reads zonacards.modules, with an error that names the variable. This also
-      // runs while the application is built, where the variable is legitimately absent.
+      // The list refers to a variable that was not given. Nothing is switched on here; the
+      // application then refuses to start (see ActiveModules.validate). This also runs while
+      // the application is built, where the variable is legitimately absent.
       list = "";
     }
     return Arrays.stream(list.split(",")).map(String::trim).filter(name -> !name.isEmpty()).collect(Collectors.toSet());

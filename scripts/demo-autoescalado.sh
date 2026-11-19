@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # SIMULATION of the autoscaling policy, on the local system.
 #
-# In AWS, Application Auto Scaling changes the number of giftcards tasks by itself. That service
-# does not exist on a laptop, so this script plays its part: it reads the same signal the
-# Terraform policy tracks (messages waiting in giftcards-generacion divided by running tasks),
-# applies the target tracking rule and changes the number of replicas with docker compose.
+# In AWS, Application Auto Scaling changes the number of tasks of a promoted module by itself.
+# That service does not exist on a laptop, so this script plays its part: it reads the same
+# signal the Terraform policy tracks (messages waiting in giftcards-generacion divided by
+# running tasks), applies the target tracking rule and changes the number of replicas with
+# docker compose. The policy belongs to the module's own service, so if giftcards lives in the
+# nucleo this script promotes it first and reintegrates it at the end.
 #
 # What is real: the queue, its backlog, the replicas doing the work and the time it takes.
 # What is simulated: the controller, and its timing. CloudWatch evaluates once a minute and the
@@ -30,16 +32,26 @@ ENFRIAR_SALIDA=10   # seconds after a scale-out before another one (policy: 60)
 ENFRIAR_ENTRADA=30  # seconds the metric must stay low before a scale-in (policy: 300)
 COLA=giftcards-generacion
 
-LOTES_ANTES="$(replicas lotes)"
-trap 'escalar giftcards "$MIN"' EXIT
+asegurar_promovido giftcards
+INICIALES="$(replicas giftcards)"
+NUCLEO_ANTES="$(replicas nucleo)"
+trap 'escalar giftcards "$INICIALES"; restaurar_topologia' EXIT
 escalar giftcards "$MIN"
 
 token="$(token_de ana)"
+# A small lote first, for two reasons. Every JVM compiles the hashing code before the lote that
+# is watched. And it gives the emulator time to forget the replicas that a promotion has just
+# stopped: it keeps handing messages to their long-polling connections for a few seconds, which
+# would show below as a queue that stays empty for the first minute (docs/autoescalado.md,
+# "Una particularidad del emulador").
+FRAGMENTO="$(en_replica giftcards printenv ZC_GIFTCARDS_FRAGMENT_SIZE)"
+cronometrar_lote "$token" "$(solicitar_lote "$token" $((FRAGMENTO * 2 * MIN)) "Calentamiento")" 600 >/dev/null
+
 id="$(solicitar_lote "$token" "$CANTIDAD" "Demo de autoescalado")"
 echo "SIMULACIÓN del controlador de autoescalado (ver cabecera de este archivo)."
 echo "Lote $id de $CANTIDAD gift cards. Política: backlog por tarea objetivo $TARGET, entre $MIN y $MAX réplicas."
 echo
-printf '%6s  %9s  %8s  %9s  %13s  %-9s  %s\n' "t (s)" "en espera" "en vuelo" "giftcards" "backlog/tarea" "lotes" "decisión"
+printf '%6s  %9s  %8s  %9s  %13s  %-9s  %s\n' "t (s)" "en espera" "en vuelo" "giftcards" "backlog/tarea" "núcleo" "decisión"
 
 inicio=$SECONDS
 ultima_salida=-1000
@@ -74,7 +86,7 @@ while :; do
   else
     bajo_desde=-1
   fi
-  printf '%6s  %9s  %8s  %9s  %13s  %-9s  %s\n' "$t" "$visibles" "$vuelo" "$actuales" "$metrica" "$(replicas lotes)" "$decision"
+  printf '%6s  %9s  %8s  %9s  %13s  %-9s  %s\n' "$t" "$visibles" "$vuelo" "$actuales" "$metrica" "$(replicas nucleo)" "$decision"
   case "$decision" in
     escalar*) escalar giftcards "$deseadas" ;;
     reducir*) escalar giftcards "$deseadas" ;;
@@ -90,5 +102,5 @@ while :; do
 done
 
 echo
-echo "Lote generado en ${terminado}s. giftcards volvió a $MIN réplicas; lotes tuvo $LOTES_ANTES en todo momento."
-[ "$(replicas lotes)" = "$LOTES_ANTES" ] || morir "lotes cambió de tamaño"
+echo "Lote generado en ${terminado}s. giftcards volvió a $MIN réplicas; el núcleo tuvo $NUCLEO_ANTES en todo momento."
+[ "$(replicas nucleo)" = "$NUCLEO_ANTES" ] || morir "el núcleo cambió de tamaño"

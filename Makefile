@@ -28,40 +28,64 @@ clean: ## Borra los directorios target
 # --- Sistema local (docker compose) -----------------------------------------------------------
 
 .PHONY: images
-images: ## Construye las imágenes de los dos servicios
-	docker compose build lotes-migrate giftcards-migrate
+images: ## Construye la imagen de la aplicación (una sola, con todos los módulos)
+	docker compose build migrate
 
 .PHONY: up
-up: ## Construye y levanta todo: PostgreSQL, SNS/SQS, Keycloak, Grafana, gateway y los dos servicios
+up: ## Construye y levanta todo: PostgreSQL, SNS/SQS, Keycloak, Grafana, gateway y la aplicación
 	scripts/local-env.sh
+	scripts/topologia.sh rutas
 	docker compose up -d --build --wait
 	@echo
 	@echo "API      http://localhost:$${ZC_PORT_API:-8080}/api/v1   (token: make token)"
 	@echo "Keycloak http://localhost:$${ZC_PORT_KEYCLOAK:-8081}      (admin / admin)"
 	@echo "Grafana  http://localhost:$${ZC_PORT_GRAFANA:-3000}"
+	@echo
+	@scripts/topologia.sh estado
 
 .PHONY: down
-down: ## Detiene el sistema local y borra sus datos (volúmenes de docker compose)
+down: ## Detiene el sistema local, borra sus datos (volúmenes) y olvida la topología
 	docker compose down --volumes --remove-orphans
+	scripts/topologia.sh restablecer
 
 .PHONY: ps
 ps: ## Estado de los contenedores del sistema local
 	docker compose ps -a
 
 .PHONY: logs
-logs: ## Sigue los logs de los dos servicios
-	docker compose logs -f lotes giftcards
+logs: ## Sigue los logs de la aplicación (núcleo y servicios propios)
+	docker compose logs -f nucleo giftcards
 
 .PHONY: token
 token: ## Imprime un token de acceso de un usuario de demostración (USUARIO=ana|luis|eva)
 	@bash -c 'source scripts/lib.sh && token_de "$${USUARIO:-ana}"'
 
+# --- Topología: qué despliegue atiende cada módulo --------------------------------------------
+
+.PHONY: topologia
+topologia: ## Muestra qué despliegue atiende cada módulo
+	@scripts/topologia.sh estado
+
+.PHONY: promover
+promover: ## Pasa un módulo a servicio propio, solo con configuración (MODULO=giftcards, opcional ETAPA=expandir|contraer)
+	scripts/topologia.sh promover "$(MODULO)" $(ETAPA)
+
+.PHONY: reintegrar
+reintegrar: ## Devuelve un módulo promovido al núcleo (MODULO=giftcards, opcional ETAPA=expandir|contraer)
+	scripts/topologia.sh reintegrar "$(MODULO)" $(ETAPA)
+
+# --- Escenarios y demostraciones --------------------------------------------------------------
+
 .PHONY: e2e
-e2e: ## Corre los escenarios de punta a punta contra el sistema local (requiere make up)
+e2e: ## Corre los escenarios de punta a punta, promoción y reintegración incluidas (requiere make up)
 	scripts/e2e.sh
 
+.PHONY: demo-promocion
+demo-promocion: ## Mide la API de lotes mientras se genera un lote grande, con giftcards en el núcleo y promovido
+	scripts/demo-promocion.sh
+
 .PHONY: demo-escalado
-demo-escalado: ## Mide el mismo lote con 1, 2 y 4 réplicas de giftcards; lotes no cambia
+demo-escalado: ## Mide el mismo lote con 1, 2 y 4 réplicas de giftcards promovido; el núcleo no cambia
 	scripts/demo-escalado.sh
 
 .PHONY: demo-autoescalado

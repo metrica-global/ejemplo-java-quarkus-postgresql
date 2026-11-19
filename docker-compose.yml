@@ -1,18 +1,26 @@
 # The whole system on one machine:
 #
-#   make up        build the images and start everything
-#   make e2e       run the end-to-end scenarios against it
-#   make down      stop and delete it (volumes included)
+#   make up                           build the image and start everything
+#   make e2e                          run the end-to-end scenarios against it
+#   make promover MODULO=giftcards    move a module to its own service, with configuration only
+#   make reintegrar MODULO=giftcards  and back
+#   make down                         stop and delete it (volumes included)
 #
 # Nothing here is a production setting: passwords, keys and tokens below are local values.
-# What IS the same as in AWS: the images, the database bootstrap script, the migration tasks,
+# What IS the same as in AWS: the image, the database bootstrap script, the migration task,
 # the messaging topology (the same Terraform module) and the environment variables.
+#
+# There is ONE application image. By default one service, `nucleo`, serves every module. The
+# service `giftcards` is the same image serving only that module; it has no replicas until the
+# module is promoted. The topology lives in three variables of .env that scripts/topologia.sh
+# maintains: ZC_NUCLEO_MODULES, ZC_GIFTCARDS_REPLICAS and ZC_RUTA_GIFTCARDS.
 
 name: zonacards
 
-x-service-environment: &service-environment
+# What every deployment of the application needs, whatever it serves.
+x-app-environment: &app-environment
   ZC_DB_URL: jdbc:postgresql://postgres:5432/zonacards
-  # Where the service reads the realm's keys. The issuer inside the tokens is the public
+  # Where the application reads the realm's keys. The issuer inside the tokens is the public
   # address of Keycloak (KC_HOSTNAME below), which is what the discovery document reports.
   ZC_OIDC_ISSUER: http://keycloak:8080/realms/zonacards
   ZC_OIDC_AUDIENCE: zonacards-api
@@ -24,7 +32,36 @@ x-service-environment: &service-environment
   OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4317
   ZC_SHUTDOWN_TIMEOUT: PT60S
 
-x-service-healthcheck: &service-healthcheck
+# What a deployment needs to serve the module lotes: its database role, its topic and its queue.
+x-module-lotes: &module-lotes
+  ZC_DB_LOTES_APP_USER: lotes_app
+  ZC_DB_LOTES_APP_PASSWORD: lotes-app-local
+  ZC_DB_LOTES_POOL_MAX: "10"
+  ZC_TOPIC_LOTES_EVENTS_ARN: arn:aws:sns:us-east-1:000000000000:zonacards-local-lotes-events
+  ZC_QUEUE_LOTES_INBOX_URL: http://floci:4566/000000000000/zonacards-local-lotes-inbox
+
+# What a deployment needs to serve the module giftcards.
+x-module-giftcards: &module-giftcards
+  ZC_DB_GIFTCARDS_APP_USER: giftcards_app
+  ZC_DB_GIFTCARDS_APP_PASSWORD: giftcards-app-local
+  ZC_DB_GIFTCARDS_POOL_MAX: "10"
+  ZC_TOPIC_GIFTCARDS_EVENTS_ARN: arn:aws:sns:us-east-1:000000000000:zonacards-local-giftcards-events
+  ZC_QUEUE_GIFTCARDS_INBOX_URL: http://floci:4566/000000000000/zonacards-local-giftcards-inbox
+  ZC_QUEUE_GIFTCARDS_GENERACION_URL: http://floci:4566/000000000000/zonacards-local-giftcards-generacion
+  # Generated into .env by `make up` (scripts/local-env.sh); no key lives in the repository.
+  # In AWS they are generated into Secrets Manager.
+  ZC_GIFTCARDS_CODIGO_KEY: ${ZC_GIFTCARDS_CODIGO_KEY:?falta .env; ejecute "make up" o scripts/local-env.sh}
+  ZC_GIFTCARDS_CODIGO_HMAC_KEY: ${ZC_GIFTCARDS_CODIGO_HMAC_KEY:?falta .env; ejecute "make up" o scripts/local-env.sh}
+  # Smaller fragments and a shorter visibility timeout than in AWS, so a demo on a laptop
+  # shows progress, and a killed task is taken over, in seconds instead of minutes.
+  ZC_GIFTCARDS_FRAGMENT_SIZE: ${ZC_GIFTCARDS_FRAGMENT_SIZE:-250}
+  # Cost of the CVV hash (Argon2id). The defaults are the production ones; they can be
+  # changed here to compare configurations (see docs/autoescalado.md).
+  ZC_GIFTCARDS_ARGON2_MEMORY_KIB: ${ZC_GIFTCARDS_ARGON2_MEMORY_KIB:-19456}
+  ZC_GIFTCARDS_ARGON2_ITERATIONS: ${ZC_GIFTCARDS_ARGON2_ITERATIONS:-2}
+  ZC_GIFTCARDS_GENERACION_VISIBILITY: PT30S
+
+x-app-healthcheck: &app-healthcheck
   # The same command and endpoint the ECS task definition uses.
   test: ["CMD-SHELL", "curl -fsS http://localhost:8080/q/health/live || exit 1"]
   interval: 5s
@@ -94,8 +131,8 @@ services:
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin
-      # Tokens carry this issuer whoever asks for them; services inside the network still
-      # reach Keycloak by its service name.
+      # Tokens carry this issuer whoever asks for them; the application inside the network
+      # still reaches Keycloak by its service name.
       KC_HOSTNAME: http://localhost:${ZC_PORT_KEYCLOAK:-8081}
       KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
       KC_HEALTH_ENABLED: "true"
@@ -116,119 +153,92 @@ services:
     ports:
       - "127.0.0.1:${ZC_PORT_GRAFANA:-3000}:3000"
 
-  # --- lotes: fixed number of replicas -----------------------------------------------------
+  # --- The application: one image ------------------------------------------------------------
 
-  lotes-migrate:
-    image: zonacards/lotes-service:local
+  # One task migrates the schema of every module, each with that module's owner role. It is
+  # the only place where the owners' credentials exist.
+  migrate:
+    image: zonacards/app:local
     build:
       context: .
-      args:
-        SERVICE: lotes
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       ZC_MODE: migrate
       ZC_DB_URL: jdbc:postgresql://postgres:5432/zonacards
-      ZC_DB_OWNER_USER: lotes_owner
-      ZC_DB_OWNER_PASSWORD: lotes-owner-local
+      ZC_DB_LOTES_OWNER_USER: lotes_owner
+      ZC_DB_LOTES_OWNER_PASSWORD: lotes-owner-local
+      ZC_DB_GIFTCARDS_OWNER_USER: giftcards_owner
+      ZC_DB_GIFTCARDS_OWNER_PASSWORD: giftcards-owner-local
     restart: "no"
 
-  lotes:
-    image: zonacards/lotes-service:local
+  # The nucleo: the service that serves every module that has not been promoted. By default,
+  # all of them.
+  nucleo:
+    image: zonacards/app:local
     depends_on:
-      lotes-migrate:
+      migrate:
         condition: service_completed_successfully
       topology:
         condition: service_completed_successfully
       keycloak:
         condition: service_healthy
     environment:
-      <<: *service-environment
-      ZC_DB_APP_USER: lotes_app
-      ZC_DB_APP_PASSWORD: lotes-app-local
-      ZC_DB_POOL_MAX: "10"
-      ZC_TOPIC_LOTES_EVENTS_ARN: arn:aws:sns:us-east-1:000000000000:zonacards-local-lotes-events
-      ZC_QUEUE_LOTES_INBOX_URL: http://floci:4566/000000000000/zonacards-local-lotes-inbox
-    healthcheck: *service-healthcheck
+      # The nucleo is given what every module needs, also the ones it is not serving now: a
+      # module can come back to it with a change of ZC_MODULES and nothing else. Its Terraform
+      # counterpart does the same with permissions and secrets.
+      <<: [*app-environment, *module-lotes, *module-giftcards]
+      ZC_MODULES: ${ZC_NUCLEO_MODULES:-lotes,giftcards}
+      OTEL_SERVICE_NAME: nucleo
+    healthcheck: *app-healthcheck
     stop_grace_period: 90s
     deploy:
-      replicas: 2
+      replicas: ${ZC_NUCLEO_REPLICAS:-2}
       resources:
         limits:
-          cpus: "0.50"
-          memory: 768M
-
-  # --- giftcards: the domain that scales ---------------------------------------------------
-  #   docker compose up -d --scale giftcards=4
-
-  giftcards-migrate:
-    image: zonacards/giftcards-service:local
-    build:
-      context: .
-      args:
-        SERVICE: giftcards
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      ZC_MODE: migrate
-      ZC_DB_URL: jdbc:postgresql://postgres:5432/zonacards
-      ZC_DB_OWNER_USER: giftcards_owner
-      ZC_DB_OWNER_PASSWORD: giftcards-owner-local
-    restart: "no"
-
-  giftcards:
-    image: zonacards/giftcards-service:local
-    depends_on:
-      giftcards-migrate:
-        condition: service_completed_successfully
-      topology:
-        condition: service_completed_successfully
-      keycloak:
-        condition: service_healthy
-    environment:
-      <<: *service-environment
-      ZC_DB_APP_USER: giftcards_app
-      ZC_DB_APP_PASSWORD: giftcards-app-local
-      ZC_DB_POOL_MAX: "10"
-      ZC_TOPIC_GIFTCARDS_EVENTS_ARN: arn:aws:sns:us-east-1:000000000000:zonacards-local-giftcards-events
-      ZC_QUEUE_GIFTCARDS_INBOX_URL: http://floci:4566/000000000000/zonacards-local-giftcards-inbox
-      ZC_QUEUE_GIFTCARDS_GENERACION_URL: http://floci:4566/000000000000/zonacards-local-giftcards-generacion
-      # Generated into .env by `make up` (scripts/local-env.sh); no key lives in the repository.
-      # In AWS they are generated into Secrets Manager.
-      ZC_GIFTCARDS_CODIGO_KEY: ${ZC_GIFTCARDS_CODIGO_KEY:?falta .env; ejecute "make up" o scripts/local-env.sh}
-      ZC_GIFTCARDS_CODIGO_HMAC_KEY: ${ZC_GIFTCARDS_CODIGO_HMAC_KEY:?falta .env; ejecute "make up" o scripts/local-env.sh}
-      # Smaller fragments and a shorter visibility timeout than in AWS, so a demo on a laptop
-      # shows progress, and a killed task is taken over, in seconds instead of minutes.
-      ZC_GIFTCARDS_FRAGMENT_SIZE: ${ZC_GIFTCARDS_FRAGMENT_SIZE:-250}
-      # Cost of the CVV hash (Argon2id). The defaults are the production ones; they can be
-      # changed here to compare configurations (see docs/autoescalado.md).
-      ZC_GIFTCARDS_ARGON2_MEMORY_KIB: ${ZC_GIFTCARDS_ARGON2_MEMORY_KIB:-19456}
-      ZC_GIFTCARDS_ARGON2_ITERATIONS: ${ZC_GIFTCARDS_ARGON2_ITERATIONS:-2}
-      ZC_GIFTCARDS_GENERACION_VISIBILITY: PT30S
-    healthcheck: *service-healthcheck
-    stop_grace_period: 90s
-    deploy:
-      replicas: 2
-      resources:
-        limits:
-          # One vCPU per replica, like the Fargate task: hashing a CVV is CPU bound, so the
-          # only way to go faster is more replicas.
+          # One vCPU per replica, like a Fargate task. While giftcards lives here, hashing
+          # CVVs competes for it with the API of lotes: the reason to promote the module.
           cpus: "1.00"
           memory: 1G
 
-  # --- Entry point: path-based routing, like the load balancer -----------------------------
+  # giftcards as its own service: the same image, serving one module, scaled on its own.
+  # No replicas until the module is promoted (make promover MODULO=giftcards).
+  giftcards:
+    image: zonacards/app:local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topology:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    environment:
+      # Only what this module needs: this deployment could not serve lotes if it wanted to.
+      <<: [*app-environment, *module-giftcards]
+      ZC_MODULES: giftcards
+      OTEL_SERVICE_NAME: giftcards
+    healthcheck: *app-healthcheck
+    stop_grace_period: 90s
+    deploy:
+      replicas: ${ZC_GIFTCARDS_REPLICAS:-0}
+      resources:
+        limits:
+          # Hashing a CVV is CPU bound, so the only way to go faster is more replicas.
+          cpus: "1.00"
+          memory: 1G
+
+  # --- Entry point: one rule per module, like the load balancer ------------------------------
 
   gateway:
     image: nginx:1.29-alpine
     depends_on:
-      lotes:
-        condition: service_healthy
-      giftcards:
+      nucleo:
         condition: service_healthy
     volumes:
       - ./deploy/local/gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      # A directory, not the file: the file is replaced on every change of topology.
+      - ./deploy/local/.state/gateway:/etc/nginx/routes:ro
     ports:
       - "127.0.0.1:${ZC_PORT_API:-8080}:8080"
 

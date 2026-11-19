@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs once, when the local database is created. Gives every service its schema and its two
+# Runs once, when the local database is created. Gives every module its schema and its two
 # roles with the SAME script the tests and the AWS bootstrap task use.
 #
 # The passwords below are for the local environment only. In AWS they are generated into
@@ -16,5 +16,8 @@ bootstrap() {
     -f /zonacards/bootstrap-service.sql
 }
 
-bootstrap lotes 40
+# Connection limit of each module's runtime role. It has to hold the module's pool in every
+# deployment that can serve it at the same time: the nucleo and, while a promotion or a
+# reintegration is in progress, the module's own service too.
+bootstrap lotes 60
 bootstrap giftcards 120

@@ -57,9 +57,19 @@ class ModulesConfigSourceFactoryTest {
   }
 
   @Test
-  void withoutTheVariableNothingIsSwitchedOnAndReadingTheListFails() {
-    // What production looks like when a deployment forgets ZC_MODULES: the factory must not be
-    // the one that fails (it also runs at build time), the read of the list must.
+  void withoutTheVariableNothingIsSwitchedOn() {
+    // What production looks like when a deployment forgets ZC_MODULES: every module is off, and
+    // the application then refuses to start because the list is empty (ActiveModules).
+    SmallRyeConfig config = config(Map.of("zonacards.modules", "${ZC_MODULES_THAT_NOBODY_SET:}"));
+
+    assertFalse(config.getValue("zonacards.module.lotes.active", Boolean.class));
+    assertFalse(config.getValue("zonacards.module.giftcards.active", Boolean.class));
+    assertFalse(config.getOptionalValue("zonacards.modules", String.class).isPresent());
+  }
+
+  @Test
+  void aListThatCannotBeResolvedDoesNotBreakTheFactory() {
+    // The factory also runs while the application is built, where no deployment variable exists.
     SmallRyeConfig config = config(Map.of("zonacards.modules", "${ZC_MODULES_THAT_NOBODY_SET}"));
 
     assertFalse(config.getValue("zonacards.module.lotes.active", Boolean.class));

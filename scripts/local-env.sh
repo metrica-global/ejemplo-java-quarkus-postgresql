@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Creates .env with the two keys the local giftcards service needs, if it does not exist yet.
+# Creates .env with the two keys the giftcards module needs locally, if they are not there yet.
 # They are random and stay on this machine: .env is ignored by git. In AWS the equivalent keys
 # are generated straight into Secrets Manager by Terraform.
+#
+# The same file also holds the local topology (which deployment serves each module); those
+# lines are written by scripts/topologia.sh and are left alone here.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
