@@ -1,0 +1,233 @@
+# The whole system on one machine:
+#
+#   make up        build the images and start everything
+#   make e2e       run the end-to-end scenarios against it
+#   make down      stop and delete it (volumes included)
+#
+# Nothing here is a production setting: passwords, keys and tokens below are local values.
+# What IS the same as in AWS: the images, the database bootstrap script, the migration tasks,
+# the messaging topology (the same Terraform module) and the environment variables.
+
+name: zonacards
+
+x-service-environment: &service-environment
+  ZC_DB_URL: jdbc:postgresql://postgres:5432/zonacards
+  # Where the service reads the realm's keys. The issuer inside the tokens is the public
+  # address of Keycloak (KC_HOSTNAME below), which is what the discovery document reports.
+  ZC_OIDC_ISSUER: http://keycloak:8080/realms/zonacards
+  ZC_OIDC_AUDIENCE: zonacards-api
+  # Only for the emulator. In AWS this variable does not exist and the SDK talks to AWS.
+  ZC_AWS_ENDPOINT: http://floci:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4317
+  ZC_SHUTDOWN_TIMEOUT: PT60S
+
+x-service-healthcheck: &service-healthcheck
+  # The same command and endpoint the ECS task definition uses.
+  test: ["CMD-SHELL", "curl -fsS http://localhost:8080/q/health/live || exit 1"]
+  interval: 5s
+  timeout: 3s
+  retries: 6
+  start_period: 40s
+
+services:
+  # --- Infrastructure ----------------------------------------------------------------------
+
+  postgres:
+    image: postgres:18
+    command: ["postgres", "-c", "max_connections=250"]
+    environment:
+      POSTGRES_DB: zonacards
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-local
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./deploy/db/bootstrap-service.sql:/zonacards/bootstrap-service.sql:ro
+      - ./deploy/local/postgres/10-bootstrap-services.sh:/docker-entrypoint-initdb.d/10-bootstrap-services.sh:ro
+    ports:
+      - "127.0.0.1:${ZC_PORT_POSTGRES:-15432}:5432"
+    healthcheck:
+      # Over TCP on purpose: the temporary server of the first start only listens on a socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d zonacards"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # SNS and SQS emulator.
+  floci:
+    image: floci/floci:2.5.0
+    ports:
+      - "127.0.0.1:${ZC_PORT_FLOCI:-14566}:4566"
+    healthcheck:
+      # The image has bash but neither curl nor grep.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4566 && printf 'GET /_floci/health HTTP/1.0\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *200* ]]"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Creates topics, queues, dead-letter queues and filtered subscriptions in the emulator with
+  # the same Terraform module the AWS environments use (infra/terraform/modules/messaging).
+  topology:
+    image: hashicorp/terraform:1.16.2
+    depends_on:
+      floci:
+        condition: service_healthy
+    working_dir: /infra/local
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        terraform init -input=false -lockfile=readonly
+        terraform apply -input=false -auto-approve -state=/state/terraform.tfstate -var endpoint=http://floci:4566
+    environment:
+      TF_DATA_DIR: /state/.terraform
+      TF_IN_AUTOMATION: "1"
+    volumes:
+      - ./infra/terraform:/infra:ro
+      - topology-state:/state
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Tokens carry this issuer whoever asks for them; services inside the network still
+      # reach Keycloak by its service name.
+      KC_HOSTNAME: http://localhost:${ZC_PORT_KEYCLOAK:-8081}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./deploy/local/keycloak/zonacards-realm.json:/opt/keycloak/data/import/zonacards-realm.json:ro
+    ports:
+      - "127.0.0.1:${ZC_PORT_KEYCLOAK:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+
+  # Grafana + Tempo + Loki + Prometheus + OpenTelemetry Collector in one container.
+  lgtm:
+    image: grafana/otel-lgtm:0.41.0
+    ports:
+      - "127.0.0.1:${ZC_PORT_GRAFANA:-3000}:3000"
+
+  # --- lotes: fixed number of replicas -----------------------------------------------------
+
+  lotes-migrate:
+    image: zonacards/lotes-service:local
+    build:
+      context: .
+      args:
+        SERVICE: lotes
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZC_MODE: migrate
+      ZC_DB_URL: jdbc:postgresql://postgres:5432/zonacards
+      ZC_DB_OWNER_USER: lotes_owner
+      ZC_DB_OWNER_PASSWORD: lotes-owner-local
+    restart: "no"
+
+  lotes:
+    image: zonacards/lotes-service:local
+    depends_on:
+      lotes-migrate:
+        condition: service_completed_successfully
+      topology:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    environment:
+      <<: *service-environment
+      ZC_DB_APP_USER: lotes_app
+      ZC_DB_APP_PASSWORD: lotes-app-local
+      ZC_DB_POOL_MAX: "10"
+      ZC_TOPIC_LOTES_EVENTS_ARN: arn:aws:sns:us-east-1:000000000000:zonacards-local-lotes-events
+      ZC_QUEUE_LOTES_INBOX_URL: http://floci:4566/000000000000/zonacards-local-lotes-inbox
+    healthcheck: *service-healthcheck
+    stop_grace_period: 90s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 768M
+
+  # --- giftcards: the domain that scales ---------------------------------------------------
+  #   docker compose up -d --scale giftcards=4
+
+  giftcards-migrate:
+    image: zonacards/giftcards-service:local
+    build:
+      context: .
+      args:
+        SERVICE: giftcards
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZC_MODE: migrate
+      ZC_DB_URL: jdbc:postgresql://postgres:5432/zonacards
+      ZC_DB_OWNER_USER: giftcards_owner
+      ZC_DB_OWNER_PASSWORD: giftcards-owner-local
+    restart: "no"
+
+  giftcards:
+    image: zonacards/giftcards-service:local
+    depends_on:
+      giftcards-migrate:
+        condition: service_completed_successfully
+      topology:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+    environment:
+      <<: *service-environment
+      ZC_DB_APP_USER: giftcards_app
+      ZC_DB_APP_PASSWORD: giftcards-app-local
+      ZC_DB_POOL_MAX: "10"
+      ZC_TOPIC_GIFTCARDS_EVENTS_ARN: arn:aws:sns:us-east-1:000000000000:zonacards-local-giftcards-events
+      ZC_QUEUE_GIFTCARDS_INBOX_URL: http://floci:4566/000000000000/zonacards-local-giftcards-inbox
+      ZC_QUEUE_GIFTCARDS_GENERACION_URL: http://floci:4566/000000000000/zonacards-local-giftcards-generacion
+      # Generated into .env by `make up` (scripts/local-env.sh); no key lives in the repository.
+      # In AWS they are generated into Secrets Manager.
+      ZC_GIFTCARDS_CODIGO_KEY: ${ZC_GIFTCARDS_CODIGO_KEY:?falta .env; ejecute "make up" o scripts/local-env.sh}
+      ZC_GIFTCARDS_CODIGO_HMAC_KEY: ${ZC_GIFTCARDS_CODIGO_HMAC_KEY:?falta .env; ejecute "make up" o scripts/local-env.sh}
+      # Smaller fragments and a shorter visibility timeout than in AWS, so a demo on a laptop
+      # shows progress, and a killed task is taken over, in seconds instead of minutes.
+      ZC_GIFTCARDS_FRAGMENT_SIZE: ${ZC_GIFTCARDS_FRAGMENT_SIZE:-250}
+      ZC_GIFTCARDS_GENERACION_VISIBILITY: PT30S
+    healthcheck: *service-healthcheck
+    stop_grace_period: 90s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          # One vCPU per replica, like the Fargate task: hashing a CVV is CPU bound, so the
+          # only way to go faster is more replicas.
+          cpus: "1.00"
+          memory: 1G
+
+  # --- Entry point: path-based routing, like the load balancer -----------------------------
+
+  gateway:
+    image: nginx:1.29-alpine
+    depends_on:
+      lotes:
+        condition: service_healthy
+      giftcards:
+        condition: service_healthy
+    volumes:
+      - ./deploy/local/gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:${ZC_PORT_API:-8080}:8080"
+
+volumes:
+  pgdata:
+  topology-state:

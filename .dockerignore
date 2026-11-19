@@ -1,0 +1,11 @@
+# The image is built from sources: pom files, libs/ and services/. Nothing else is needed.
+.git
+.github
+**/target
+docs
+deploy
+infra
+scripts
+*.md
+.env
+.env.*
