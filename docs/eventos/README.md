@@ -1,9 +1,15 @@
 # Contrato de eventos de Zonacards
 
-Los servicios `lotes` y `giftcards` no se llaman entre sí: se comunican solo por eventos. Cada
+Los módulos `lotes` y `giftcards` no se llaman entre sí: se comunican solo por eventos. Cada
 uno publica en su propio topic SNS y cada consumidor lee de su propia cola SQS. Este directorio
-es el contrato de esos mensajes. No hay código compartido entre los dos dominios: el contrato es
+es el contrato de esos mensajes. No hay código compartido entre los dos módulos: el contrato es
 el JSON que aquí se describe, y cada lado declara en su propio código la parte que usa.
+
+Los dos módulos son partes de **una misma aplicación** y pueden correr en el mismo proceso (el
+núcleo) o en servicios distintos (cuando uno se promueve). Para este contrato no hay diferencia:
+un evento sale por el *outbox*, va al topic y llega a la cola **también cuando emisor y
+receptor comparten proceso**. No existe un camino en memoria. Por eso un módulo puede pasar a
+servicio propio, o volver, sin que cambie nada de lo que aquí se describe.
 
 | Archivo | Contenido |
 |---|---|
@@ -42,13 +48,13 @@ un único objeto JSON con los atributos del sobre y, dentro de `data`, la carga.
 |---|---|---|---|---|
 | `specversion` | CloudEvents | siempre | cadena | `"1.0"`. |
 | `id` | CloudEvents | siempre | UUID versión 7 | Único por evento. Los consumidores deduplican por él: una reentrega trae el mismo `id`. Es también la clave de la fila en el outbox del productor. |
-| `source` | CloudEvents | siempre | referencia URI | Servicio que produjo el evento: `/zonacards/lotes` o `/zonacards/giftcards`. |
+| `source` | CloudEvents | siempre | referencia URI | Módulo que produjo el evento: `/zonacards/lotes` o `/zonacards/giftcards`. |
 | `type` | CloudEvents | siempre | cadena | `zonacards.<dominio>.<hecho>.v<mayor>` (sección 2). Determina el esquema de `data`. |
 | `subject` | CloudEvents | siempre | UUID | Identificador del agregado del que habla el evento: el `loteId` o el `giftCardId`. |
 | `time` | CloudEvents | siempre | instante ISO-8601 en UTC | Momento en que el productor creó el evento, dentro de la transacción de negocio. No es la hora de publicación ni la de entrega. |
 | `datacontenttype` | CloudEvents | siempre | cadena | `"application/json"`. |
 | `tenantid` | **extensión** | siempre | cadena | Tenant dueño del agregado (por ejemplo `pe`). En un evento nacido de una petición HTTP es el `tenant_id` del token de quien la hizo; en uno nacido de otro evento, el del evento consumido. El handler del consumidor solo puede tocar filas de ese tenant. |
-| `correlationid` | **extensión** | siempre | cadena | Une todo lo causado por una misma petición. Se fija en los dos puntos de entrada de un servicio (una petición HTTP: la cabecera `X-Request-ID` si llega con forma válida, o un UUID nuevo; un mensaje consumido: el `correlationid` de ese mensaje) y se copia en cada evento producido mientras se atiende. Un mismo valor recorre así los dos dominios. |
+| `correlationid` | **extensión** | siempre | cadena | Une todo lo causado por una misma petición. Se fija en los dos puntos de entrada de un módulo (una petición HTTP: la cabecera `X-Request-ID` si llega con forma válida, o un UUID nuevo; un mensaje consumido: el `correlationid` de ese mensaje) y se copia en cada evento producido mientras se atiende. Un mismo valor recorre así los dos dominios. |
 | `traceparent` | **extensión** | opcional | `00-<trace-id>-<span-id>-<flags>` (W3C Trace Context) | Span del productor en el momento de escribir el evento en el outbox. El consumidor abre su span como hijo de este. Se omite cuando no hay un span válido. |
 | `data` | CloudEvents | siempre | objeto JSON | Carga del evento. Su esquema pertenece al productor y se versiona con `type`. |
 
@@ -105,8 +111,8 @@ El tipo completo es a la vez el valor del atributo `type` del sobre, el del atri
 ## 3. Catálogo de eventos
 
 Las constantes y los records de cada productor están en `LoteEvents`
-(`services/lotes-service/.../lotes/events/`) y `GiftcardsEvents`
-(`services/giftcards-service/.../giftcards/events/`). La vista de cada consumidor está en el
+(`app/.../lotes/events/`) y `GiftcardsEvents`
+(`app/.../giftcards/events/`). La vista de cada consumidor está en el
 paquete `events` del consumidor (`GiftcardsEvents` en lotes, `LotesEvents` en giftcards).
 
 `lotes` publica en el topic `lotes-events` con `source` `/zonacards/lotes`; `giftcards` publica en
@@ -162,14 +168,15 @@ Por qué viaja por una cola y no por el topic público:
   ni tiene archivo en `ejemplos/`.
 - **Es la unidad de trabajo y de escalado.** Un lote se divide en fragmentos de 1000 gift cards
   por defecto (`ZC_GIFTCARDS_FRAGMENT_SIZE`); un lote de 200000 son 200 comandos. Cualquier tarea
-  del servicio puede tomar cualquier fragmento, y la profundidad de esta cola es la señal con la
-  que el servicio escala.
+  que atienda el módulo puede tomar cualquier fragmento, y la profundidad de esta cola es la
+  señal con la que escala su servicio cuando el módulo está promovido.
 - **Es trabajo pesado.** Generar un fragmento es intensivo en CPU (un hash de CVV por gift card).
   La cola tiene por eso un tiempo de visibilidad de 300 s y una alarma de antigüedad de 1800 s,
   frente a los 60 s y 600 s de las colas de eventos, y su consumidor procesa 2 mensajes a la vez
   por tarea en lugar de 4.
-- **Permisos.** Solo el rol de `giftcards-service` puede enviar a esa cola y consumir de ella
-  (`infra/terraform/modules/platform/services.tf`).
+- **Permisos.** En la aplicación, solo el módulo `giftcards` conoce esa cola. En AWS pueden
+  enviar a ella y consumirla los servicios que pueden atender el módulo: el núcleo y, si
+  existe, el servicio propio de `giftcards` (`infra/terraform/modules/platform/catalog.tf`).
 
 En `asyncapi.yaml` aparece al final de cada sección, con la etiqueta `interno`.
 
@@ -185,7 +192,7 @@ En `asyncapi.yaml` aparece al final de cada sección, con la etiqueta `interno`.
   publicar al vencer su reserva. SQS reentrega un mensaje que no se confirmó a tiempo, cuyo
   handler falló o cuyo borrado falló tras confirmar la transacción.
 - **No hay orden**, ni global ni por lote. Los topics y las colas son estándar, no FIFO; cada
-  tarea de un servicio ejecuta su propio relay; cada consumidor procesa varios mensajes a la vez;
+  tarea que atiende un módulo ejecuta su relay; cada consumidor procesa varios mensajes a la vez;
   y un mensaje fallido se reentrega más tarde, cuando otros ya pasaron.
 
 No se garantiza entrega exactamente una vez ni orden de llegada. Lo que sí se garantiza es el
@@ -194,7 +201,7 @@ cualquier orden.
 
 ### 5.1 Mecanismo común: inbox
 
-Lo aplica `MessageDispatcher` (`libs/eventx`) antes de cada handler, en los dos servicios:
+Lo aplica `MessageDispatcher` (`libs/eventx`) antes de cada handler, en los dos módulos:
 
 - Tabla `inbox` con clave `(consumer, message_id)`: el consumidor (`lotes` o `giftcards`) y el
   `id` del sobre. El registro se inserta con `ON CONFLICT DO NOTHING` **en la misma transacción**
@@ -263,29 +270,30 @@ Se declara una sola vez, en `infra/terraform/modules/messaging/topology/outputs.
 flowchart LR
     subgraph interno["Interno de giftcards: sin topic ni suscripción"]
         direction LR
-        wg["giftcards-service"] -- "envía generar-fragmento" --> qw[["cola SQS<br/>giftcards-generacion"]]
-        qw -- consume --> xg["giftcards-service"]
+        wg["giftcards"] -- "envía generar-fragmento" --> qw[["cola SQS<br/>giftcards-generacion"]]
+        qw -- consume --> xg["giftcards"]
         qw -. "tras 5 recepciones" .-> dw[["giftcards-generacion-dlq"]]
     end
     subgraph eventosGiftcards["Eventos de giftcards"]
         direction LR
-        pg["giftcards-service"] -- publica --> tg(["topic SNS<br/>giftcards-events"])
+        pg["giftcards"] -- publica --> tg(["topic SNS<br/>giftcards-events"])
         tg -- "suscripción filtrada por type:<br/>generacion-iniciada<br/>fragmento-generado<br/>fragmento-fallido<br/>lote-anulado-aplicado" --> ql[["cola SQS<br/>lotes-inbox"]]
-        ql -- consume --> cl["lotes-service"]
+        ql -- consume --> cl["lotes"]
         ql -. "tras 5 recepciones" .-> dl[["lotes-inbox-dlq"]]
     end
     subgraph eventosLotes["Eventos de lotes"]
         direction LR
-        pl["lotes-service"] -- publica --> tl(["topic SNS<br/>lotes-events"])
+        pl["lotes"] -- publica --> tl(["topic SNS<br/>lotes-events"])
         tl -- "suscripción filtrada por type:<br/>lote-solicitado<br/>lote-anulado" --> qg[["cola SQS<br/>giftcards-inbox"]]
-        qg -- consume --> cg["giftcards-service"]
+        qg -- consume --> cg["giftcards"]
         qg -. "tras 5 recepciones" .-> dg[["giftcards-inbox-dlq"]]
     end
 ```
 
 Cada bloque es un camino independiente: quien publica o envía a la izquierda, quien consume a la
-derecha. Los dos servicios aparecen en varios bloques porque cada uno publica en su topic y
-consume de las colas que le pertenecen.
+derecha. Los dos módulos aparecen en varios bloques porque cada uno publica en su topic y
+consume de las colas que le pertenecen. El diagrama es el mismo con los dos módulos en el
+núcleo o con `giftcards` en su propio servicio: lo que cambia es en qué tareas corre cada caja.
 
 | Cola | Suscrita a | Filtro (atributo de mensaje `type`) | Visibilidad | Consumidor |
 |---|---|---|---|---|
@@ -308,9 +316,15 @@ Resto de la configuración (`infra/terraform/modules/messaging`):
 - **Tipo.** Topics y colas estándar, no FIFO. Cifrado con una llave KMS propia en AWS.
 - **Nombres.** El código y Terraform usan nombres lógicos (los de esta tabla). El nombre físico
   es `<prefijo>-<nombre lógico>`, con prefijo `zonacards-<entorno>` (`zonacards-dev-lotes-inbox`,
-  `zonacards-local-lotes-inbox`). Cada servicio recibe el ARN del topic o la URL de la cola por
-  configuración (`ZC_TOPIC_*_ARN`, `ZC_QUEUE_*_URL`) y no puede alcanzar lo que no se le dio.
-- **Permisos.** Cada servicio publica solo en su topic y consume solo de sus colas.
+  `zonacards-local-lotes-inbox`). Cada despliegue recibe por configuración el ARN del topic y la
+  URL de las colas de los módulos que puede atender (`ZC_TOPIC_*_ARN`, `ZC_QUEUE_*_URL`) y no
+  puede alcanzar lo que no se le dio.
+- **Permisos.** Se derivan del catálogo de módulos de Terraform: quien atiende un módulo
+  publica en su topic y consume de sus colas. El servicio propio de un módulo promovido tiene
+  **solo** los de ese módulo. El núcleo tiene los de todos, también los de un módulo que en ese
+  momento no atiende, para que el módulo pueda volver con un cambio de configuración. Dentro
+  del núcleo la separación entre módulos no la da IAM sino el código (ArchUnit) y la base de
+  datos (un rol por módulo).
 
 ## 7. Versionado y evolución
 
@@ -346,14 +360,14 @@ contra el mismo archivo y no comparten código. La utilidad es `ContractExamples
 | Método | Lado | Qué hace |
 |---|---|---|
 | `load(type)` | ambos | Lee `docs/eventos/ejemplos/<type>.json`. Falla si el `type` del archivo no coincide con su nombre. |
-| `assertMatches(type, producido)` | productor | Compara lo que el servicio emite realmente con el ejemplo: los mismos atributos de sobre (solo puede faltar `traceparent`), cada uno de la misma clase JSON, y exactamente los mismos campos de `data`, de la misma clase, de forma recursiva. Falla tanto si falta un campo como si sobra uno sin documentar. |
+| `assertMatches(type, producido)` | productor | Compara lo que el módulo emite realmente con el ejemplo: los mismos atributos de sobre (solo puede faltar `traceparent`), cada uno de la misma clase JSON, y exactamente los mismos campos de `data`, de la misma clase, de forma recursiva. Falla tanto si falta un campo como si sobra uno sin documentar. |
 | `instance(type, tenantId, valores)` | consumidor | Construye un evento nuevo a partir del ejemplo: `id` nuevo, el tenant indicado y los valores dados sustituyendo campos de `data` (sustituir un campo que el ejemplo no tiene falla); si se sustituye `loteId`, `subject` toma ese valor. Es lo que la prueba entrega al handler. |
 
 Si un productor cambia un campo, fallan sus propias pruebas en `assertMatches`, antes de afectar
 a ningún consumidor. Y el consumidor se prueba con la forma que el productor tiene comprobada, no
 con una escrita a mano.
 
-Usos en las pruebas de cada servicio:
+Usos en las pruebas de cada módulo:
 
 - **`lotes` como productor** — `LoteApiIT.creatingALoteAnswersAtOnceAndPublishesItsEvent`: crea
   un lote por HTTP, lee el evento del emulador con `EventSpy` (una cola suscrita al topic sin

@@ -4,10 +4,12 @@ info:
   title: Zonacards - contrato de eventos entre lotes y giftcards
   version: 1.0.0
   description: |
-    Contrato de los mensajes que intercambian los servicios `lotes` y `giftcards` de Zonacards.
-    Los dos dominios no se llaman entre sí: se comunican solo por eventos.
+    Contrato de los mensajes que intercambian los módulos `lotes` y `giftcards` de Zonacards.
+    Los dos son partes de una misma aplicación y pueden correr en el mismo proceso o en
+    servicios distintos; en ambos casos no se llaman entre sí: se comunican solo por eventos,
+    por estos canales.
 
-    - Cada servicio publica en su propio topic SNS: `lotes-events` y `giftcards-events`.
+    - Cada módulo publica en su propio topic SNS: `lotes-events` y `giftcards-events`.
     - Cada consumidor lee de su propia cola SQS (`giftcards-inbox`, `lotes-inbox`), suscrita al
       topic del otro dominio con un filtro sobre el atributo de mensaje `type` y con entrega sin
       envoltura (*raw message delivery*): el cuerpo que llega a la cola es el que publicó el
@@ -33,8 +35,8 @@ info:
 
     **Nombres.** Los canales usan los nombres lógicos del código y de Terraform. El nombre
     físico en AWS es `zonacards-<entorno>-<nombre lógico>` (por ejemplo
-    `zonacards-dev-lotes-events`); cada servicio recibe por configuración el ARN o la URL de lo
-    que usa.
+    `zonacards-dev-lotes-events`); cada despliegue recibe por configuración el ARN o la URL de
+    lo que usan los módulos que atiende.
 
     **Ejemplos.** El ejemplo de cada evento es una copia de `docs/eventos/ejemplos/<type>.json`.
     Esos archivos son normativos: las pruebas del productor y del consumidor se ejecutan contra
@@ -54,9 +56,9 @@ servers:
     protocol: sns
     title: Amazon SNS
     description: >-
-      Topics SNS estándar en los que cada dominio publica sus eventos. Los servicios publican
-      contra el ARN que reciben por configuración. En el entorno local el mismo conjunto de
-      topics y colas se crea en un emulador (`infra/terraform/local`) y los servicios apuntan a
+      Topics SNS estándar en los que cada módulo publica sus eventos. La aplicación publica
+      contra el ARN que recibe por configuración. En el entorno local el mismo conjunto de
+      topics y colas se crea en un emulador (`infra/terraform/local`) y la aplicación apunta a
       él con `ZC_AWS_ENDPOINT`.
     variables:
       region:
@@ -66,8 +68,8 @@ servers:
     protocol: sqs
     title: Amazon SQS
     description: >-
-      Colas SQS estándar de las que consume cada servicio, cada una con su cola de mensajes
-      muertos. Los servicios consumen de la URL que reciben por configuración.
+      Colas SQS estándar de las que consume cada módulo, cada una con su cola de mensajes
+      muertos. La aplicación consume de la URL que recibe por configuración.
     variables:
       region:
         $ref: '#/components/serverVariables/region'
@@ -81,8 +83,8 @@ channels:
     title: Topic SNS lotes-events
     summary: Eventos públicos del dominio lotes.
     description: |
-      Topic SNS estándar (sin orden) en el que `lotes-service` publica sus eventos. Es su único
-      publicador. Nombre físico `zonacards-<entorno>-lotes-events`; el servicio recibe el ARN en
+      Topic SNS estándar (sin orden) en el que el módulo `lotes` publica sus eventos. Es su único
+      publicador. Nombre físico `zonacards-<entorno>-lotes-events`; la aplicación recibe el ARN en
       `ZC_TOPIC_LOTES_EVENTS_ARN`.
 
       Tiene una suscripción: la cola `giftcards-inbox`, filtrada por el atributo de mensaje
@@ -114,8 +116,8 @@ channels:
     title: Topic SNS giftcards-events
     summary: Eventos públicos del dominio giftcards.
     description: |
-      Topic SNS estándar (sin orden) en el que `giftcards-service` publica sus eventos. Es su
-      único publicador. Nombre físico `zonacards-<entorno>-giftcards-events`; el servicio recibe
+      Topic SNS estándar (sin orden) en el que el módulo `giftcards` publica sus eventos. Es su
+      único publicador. Nombre físico `zonacards-<entorno>-giftcards-events`; la aplicación recibe
       el ARN en `ZC_TOPIC_GIFTCARDS_EVENTS_ARN`.
 
       Tiene una suscripción: la cola `lotes-inbox`, filtrada por el atributo de mensaje `type`
@@ -156,7 +158,7 @@ channels:
     title: Cola SQS giftcards-inbox
     summary: Lo que giftcards necesita oír de lotes.
     description: |
-      Cola SQS estándar de la que consume `giftcards-service`. Está suscrita al topic
+      Cola SQS estándar de la que consume el módulo `giftcards`. Está suscrita al topic
       `lotes-events` con un filtro sobre el atributo de mensaje `type` (alcance
       `MessageAttributes`) que solo deja pasar `zonacards.lotes.lote-solicitado.v1` y
       `zonacards.lotes.lote-anulado.v1`. La entrega es sin envoltura: el cuerpo es el sobre
@@ -169,7 +171,7 @@ channels:
         curso. Espera de lectura (*long polling*) de 20 s. Retención de 4 días.
       - Un mensaje recibido 5 veces sin confirmarse pasa a `giftcards-inbox-dlq`, que lo retiene
         14 días.
-      - Nombre físico `zonacards-<entorno>-giftcards-inbox`; el servicio recibe la URL en
+      - Nombre físico `zonacards-<entorno>-giftcards-inbox`; la aplicación recibe la URL en
         `ZC_QUEUE_GIFTCARDS_INBOX_URL`.
     servers:
       - $ref: '#/servers/sqs'
@@ -204,7 +206,7 @@ channels:
     title: Cola SQS lotes-inbox
     summary: Lo que lotes necesita oír de giftcards.
     description: |
-      Cola SQS estándar de la que consume `lotes-service`. Está suscrita al topic
+      Cola SQS estándar de la que consume el módulo `lotes`. Está suscrita al topic
       `giftcards-events` con un filtro sobre el atributo de mensaje `type` (alcance
       `MessageAttributes`) que solo deja pasar `zonacards.giftcards.generacion-iniciada.v1`,
       `zonacards.giftcards.fragmento-generado.v1`, `zonacards.giftcards.fragmento-fallido.v1` y
@@ -218,7 +220,7 @@ channels:
         curso. Espera de lectura (*long polling*) de 20 s. Retención de 4 días.
       - Un mensaje recibido 5 veces sin confirmarse pasa a `lotes-inbox-dlq`, que lo retiene
         14 días.
-      - Nombre físico `zonacards-<entorno>-lotes-inbox`; el servicio recibe la URL en
+      - Nombre físico `zonacards-<entorno>-lotes-inbox`; la aplicación recibe la URL en
         `ZC_QUEUE_LOTES_INBOX_URL`.
     servers:
       - $ref: '#/servers/sqs'
@@ -260,21 +262,22 @@ channels:
     title: INTERNO - cola SQS giftcards-generacion
     summary: Cola de trabajo interna de giftcards. Fuera del contrato público.
     description: |
-      **Canal interno del dominio giftcards.** Ningún otro servicio debe publicar ni consumir
-      aquí, y su mensaje puede cambiar junto con el código de `giftcards-service` sin las reglas
+      **Canal interno del módulo giftcards.** Ningún otro módulo debe publicar ni consumir
+      aquí, y su mensaje puede cambiar junto con el código de `giftcards` sin las reglas
       de versionado de los eventos públicos.
 
-      Cola SQS estándar sin suscripción a ningún topic: `giftcards-service` envía directamente a
-      ella los comandos `generar-fragmento` (uno por fragmento de un lote) y él mismo los
-      consume. Cualquier tarea del servicio puede tomar cualquier fragmento; la profundidad de
-      esta cola es la señal con la que el servicio escala.
+      Cola SQS estándar sin suscripción a ningún topic: el módulo `giftcards` envía directamente
+      a ella los comandos `generar-fragmento` (uno por fragmento de un lote) y él mismo los
+      consume. Cualquier tarea que atienda el módulo puede tomar cualquier fragmento; la
+      profundidad de esta cola es la señal con la que escala su servicio cuando el módulo está
+      promovido.
 
       - Tiempo de visibilidad de 300 s, porque generar un fragmento es intensivo en CPU; el
         consumidor lo renueva mientras el fragmento sigue en curso. Espera de lectura de 20 s.
         Retención de 4 días.
       - Un mensaje recibido 5 veces sin confirmarse pasa a `giftcards-generacion-dlq`, que lo
         retiene 14 días.
-      - Nombre físico `zonacards-<entorno>-giftcards-generacion`; el servicio recibe la URL en
+      - Nombre físico `zonacards-<entorno>-giftcards-generacion`; la aplicación recibe la URL en
         `ZC_QUEUE_GIFTCARDS_GENERACION_URL`.
     servers:
       - $ref: '#/servers/sqs'
@@ -312,7 +315,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-events'
     title: lotes publica lote-solicitado
-    summary: lotes-service publica zonacards.lotes.lote-solicitado.v1 al aceptar un lote nuevo.
+    summary: lotes publica zonacards.lotes.lote-solicitado.v1 al aceptar un lote nuevo.
     description: |
       `LoteService.crear`. El evento se escribe en el outbox en la misma transacción que crea el
       lote. Un reintento con la misma `Idempotency-Key` devuelve el lote ya creado y no publica
@@ -329,7 +332,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-events'
     title: lotes publica lote-anulado
-    summary: lotes-service publica zonacards.lotes.lote-anulado.v1 la primera vez que se anula un lote.
+    summary: lotes publica zonacards.lotes.lote-anulado.v1 la primera vez que se anula un lote.
     description: |
       `LoteService.anular`. Un lote puede anularse en cualquier estado: antes, durante o después
       de la generación. Anular un lote que ya estaba anulado no publica nada.
@@ -345,7 +348,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-events'
     title: lotes publica lote-generado
-    summary: lotes-service publica zonacards.lotes.lote-generado.v1 al registrar el último fragmento.
+    summary: lotes publica zonacards.lotes.lote-generado.v1 al registrar el último fragmento.
     description: |
       `LoteEventHandlers.onFragmentoGenerado`. Cuando el fragmento registrado completa el total,
       el lote pasa a `GENERADO` y el evento se publica en la misma transacción. Una vez por lote.
@@ -361,7 +364,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-events'
     title: lotes publica lote-fallido
-    summary: lotes-service publica zonacards.lotes.lote-fallido.v1 cuando la generación no puede completarse.
+    summary: lotes publica zonacards.lotes.lote-fallido.v1 cuando la generación no puede completarse.
     description: |
       `LoteEventHandlers.onFragmentoFallido`. Cuando un `fragmento-fallido` lleva a `FALLIDO` un
       lote que no estaba en estado terminal. Si el lote ya era terminal no se publica nada.
@@ -380,7 +383,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica generacion-iniciada
-    summary: giftcards-service publica zonacards.giftcards.generacion-iniciada.v1 al planificar un lote.
+    summary: giftcards publica zonacards.giftcards.generacion-iniciada.v1 al planificar un lote.
     description: |
       `GeneracionHandlers.onLoteSolicitado`. El plan, los comandos de fragmento y este evento se
       confirman en la misma transacción. No se publica si el lote ya tenía plan (reentrega de la
@@ -397,7 +400,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica fragmento-generado
-    summary: giftcards-service publica zonacards.giftcards.fragmento-generado.v1 al guardar un fragmento.
+    summary: giftcards publica zonacards.giftcards.fragmento-generado.v1 al guardar un fragmento.
     description: |
       `GeneracionHandlers.onGenerarFragmento` (paso `guardar`). Se publica en la misma
       transacción que guarda las gift cards del fragmento. Hay un evento por fragmento, no uno
@@ -414,7 +417,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica fragmento-fallido
-    summary: giftcards-service publica zonacards.giftcards.fragmento-fallido.v1 cuando un fragmento no puede generarse.
+    summary: giftcards publica zonacards.giftcards.fragmento-fallido.v1 cuando un fragmento no puede generarse.
     description: |
       `GeneracionHandlers.onGenerarFragmento` (paso `fallar`). Solo para fallos que reintentar no
       resolvería, por ejemplo no encontrar códigos únicos tras 5 rondas de reemplazo. El plan
@@ -432,7 +435,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica lote-anulado-aplicado
-    summary: giftcards-service publica zonacards.giftcards.lote-anulado-aplicado.v1 al anular el plan y las gift cards de un lote.
+    summary: giftcards publica zonacards.giftcards.lote-anulado-aplicado.v1 al anular el plan y las gift cards de un lote.
     description: |
       `GeneracionHandlers.onLoteAnulado`. Se publica en la misma transacción que anula el plan y
       las gift cards que existían. No se publica si el plan ya estaba anulado.
@@ -448,7 +451,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica giftcard-emitida
-    summary: giftcards-service publica zonacards.giftcards.giftcard-emitida.v1 al emitir una gift card individual.
+    summary: giftcards publica zonacards.giftcards.giftcard-emitida.v1 al emitir una gift card individual.
     description: |
       `GiftCardService.emitir`. Solo para la emisión individual por la API. Las gift cards
       generadas dentro de un lote no producen este evento: su avance se anuncia por fragmento.
@@ -464,7 +467,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica giftcard-activada
-    summary: giftcards-service publica zonacards.giftcards.giftcard-activada.v1 al activar una gift card.
+    summary: giftcards publica zonacards.giftcards.giftcard-activada.v1 al activar una gift card.
     description: |
       `GiftCardService.activar`. Activar una gift card que ya estaba activa no publica nada.
     tags:
@@ -479,7 +482,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-events'
     title: giftcards publica giftcard-anulada
-    summary: giftcards-service publica zonacards.giftcards.giftcard-anulada.v1 al anular una gift card individual.
+    summary: giftcards publica zonacards.giftcards.giftcard-anulada.v1 al anular una gift card individual.
     description: |
       `GiftCardService.anular`. Anular una gift card ya anulada no publica nada. La anulación en
       bloque por anulación de lote no produce este evento: se anuncia con
@@ -499,7 +502,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-inbox'
     title: giftcards recibe lote-solicitado
-    summary: giftcards-service planifica la generación del lote.
+    summary: giftcards planifica la generación del lote.
     description: |
       `GeneracionHandlers.onLoteSolicitado`. Guarda un plan y divide el trabajo en fragmentos:
       envía un comando `generar-fragmento` por fragmento a su cola interna y publica
@@ -517,7 +520,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-inbox'
     title: giftcards recibe lote-anulado
-    summary: giftcards-service detiene el plan y anula las gift cards generadas.
+    summary: giftcards detiene el plan y anula las gift cards generadas.
     description: |
       `GeneracionHandlers.onLoteAnulado`. Anula el plan, anula en la misma transacción las gift
       cards del lote que ya existían y publica `lote-anulado-aplicado`.
@@ -538,7 +541,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-inbox'
     title: lotes recibe generacion-iniciada
-    summary: lotes-service marca el lote como en generación.
+    summary: lotes marca el lote como en generación.
     description: |
       `LoteEventHandlers.onGeneracionIniciada`. Pasa el lote de `SOLICITADO` a `EN_GENERACION` y
       anota el total de fragmentos. En cualquier otro estado no cambia nada: este evento puede
@@ -553,7 +556,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-inbox'
     title: lotes recibe fragmento-generado
-    summary: lotes-service registra el avance y, con el último fragmento, da el lote por generado.
+    summary: lotes registra el avance y, con el último fragmento, da el lote por generado.
     description: |
       `LoteEventHandlers.onFragmentoGenerado`. Registra el número de fragmento en un conjunto
       (tabla `lote_fragmento`, clave `lote_id` + `fragmento`): un fragmento cuenta una sola vez
@@ -573,7 +576,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-inbox'
     title: lotes recibe fragmento-fallido
-    summary: lotes-service da el lote por fallido.
+    summary: lotes da el lote por fallido.
     description: |
       `LoteEventHandlers.onFragmentoFallido`. Pasa el lote a `FALLIDO` con el motivo
       `Fragmento <n>: <motivo>` y publica `lote-fallido`. Si el lote ya estaba en estado terminal
@@ -588,7 +591,7 @@ operations:
     channel:
       $ref: '#/channels/lotes-inbox'
     title: lotes recibe lote-anulado-aplicado
-    summary: lotes-service anota que giftcards aplicó la anulación.
+    summary: lotes anota que giftcards aplicó la anulación.
     description: |
       `LoteEventHandlers.onAnulacionAplicada`. Anota en el lote anulado cuándo se aplicó la
       anulación y cuántas gift cards se anularon. Solo la primera vez: si ya estaba anotado no
@@ -606,7 +609,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-generacion'
     title: INTERNO - giftcards envía generar-fragmento
-    summary: giftcards-service reparte el trabajo de un lote en su propia cola.
+    summary: giftcards reparte el trabajo de un lote en su propia cola.
     description: |
       **Operación interna del dominio giftcards.** `GeneracionHandlers.onLoteSolicitado`
       (`outbox.sendAll`): un comando por fragmento, escrito en el outbox en la misma transacción
@@ -622,7 +625,7 @@ operations:
     channel:
       $ref: '#/channels/giftcards-generacion'
     title: INTERNO - giftcards ejecuta generar-fragmento
-    summary: giftcards-service genera las gift cards de un fragmento.
+    summary: giftcards genera las gift cards de un fragmento.
     description: |
       **Operación interna del dominio giftcards.** `GeneracionHandlers.onGenerarFragmento`, en
       tres pasos:
@@ -648,15 +651,15 @@ components:
   tags:
     giftcards:
       name: giftcards
-      description: Dominio giftcards (`giftcards-service`).
+      description: Módulo giftcards.
     interno:
       name: interno
       description: >-
-        Mensajería interna de un dominio. No es parte del contrato público: puede cambiar con el
-        código del servicio que la usa.
+        Mensajería interna de un módulo. No es parte del contrato público: puede cambiar con el
+        código del módulo que la usa.
     lotes:
       name: lotes
-      description: Dominio lotes (`lotes-service`).
+      description: Módulo lotes.
 
   serverVariables:
     region:
@@ -1301,7 +1304,7 @@ components:
           enum:
             - /zonacards/lotes
             - /zonacards/giftcards
-          description: Servicio que produjo el evento, como referencia URI.
+          description: Módulo que produjo el evento, como referencia URI.
         type:
           type: string
           pattern: '^zonacards\.[a-z]+\.[a-z]+(-[a-z]+)*\.v[1-9][0-9]*$'

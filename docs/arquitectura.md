@@ -1,20 +1,101 @@
 # Arquitectura
 
-Este documento explica cómo está construido cada servicio, qué aporta la librería interna, cómo
-se corresponde con Manifesto y qué reglas hacen correcta la saga de emisión.
+Este documento explica cómo se organiza la aplicación en módulos, cómo está construido cada
+módulo, qué aporta la librería interna, cómo se corresponde con Manifesto y qué reglas hacen
+correcta la saga de emisión.
+
+## Una aplicación, varios módulos
+
+Zonacards es **una aplicación** que se compila en **una imagen**. Dentro hay módulos, uno por
+dominio (`lotes` y `giftcards`), y cada uno es dueño de sus reglas, de su esquema de base de
+datos, de su API y de sus colas.
+
+```
+app/src/main/java/com/zonacards/
+  app/          AppContainer: la lista de módulos y lo poco que comparten (reloj, códec de eventos)
+  lotes/        un módulo: dominio + srv, infra, api, container, events
+  giftcards/    otro módulo, con la misma forma
+app/src/main/resources/
+  application.properties
+  db/lotes/  db/giftcards/        migraciones de cada módulo
+```
+
+La imagen **contiene** siempre todos los módulos. Un despliegue **atiende** solo los que lista
+en `ZC_MODULES`:
+
+| Despliegue | `ZC_MODULES` | Qué es |
+|---|---|---|
+| núcleo, por defecto | `lotes,giftcards` | Un servicio con toda la aplicación |
+| núcleo, con `giftcards` promovido | `lotes` | El mismo servicio, sin ese módulo |
+| servicio propio de `giftcards` | `giftcards` | La misma imagen, atendiendo un módulo y escalando por su cuenta |
+
+```mermaid
+flowchart LR
+    subgraph n1["Por defecto: todo en el núcleo"]
+      direction TB
+      a1["núcleo ×2<br/>ZC_MODULES=lotes,giftcards"]
+    end
+    subgraph n2["Con giftcards promovido"]
+      direction TB
+      b1["núcleo ×2<br/>ZC_MODULES=lotes"]
+      b2["giftcards ×2…N (autoescala)<br/>ZC_MODULES=giftcards"]
+    end
+    n1 -- "configuración,<br/>misma imagen" --> n2
+    n2 -- "configuración,<br/>misma imagen" --> n1
+```
+
+Pasar de una forma a la otra no cambia código ni versión. Por qué es así, y lo que cuesta, está
+en `docs/decisiones.md` (decisiones 1 a 4); el procedimiento, en `docs/operacion.md`.
+
+### Qué significa atender, o no, un módulo
+
+Lo decide `libs/server`, igual para cualquier módulo:
+
+| | Módulo atendido | Módulo no atendido |
+|---|---|---|
+| Su grafo de objetos | Se construye **al arrancar**, tras comprobar que el despliegue trae sus topics, sus colas y sus llaves (`Preflight`). Si falta algo, la tarea no arranca | **No se construye**: el despliegue no necesita sus credenciales, sus colas ni sus llaves |
+| Su API | Responde | `404` con el cuerpo de error estándar y el código `MODULE_NOT_SERVED` (`ModuleRoutingFilter`), sin instanciar nada |
+| Sus consumidores y su *relay* | Corren | No arrancan |
+| Su *datasource* | Activo, con el rol `<módulo>_app` | Inactivo: sin conexiones y sin comprobación de salud |
+| *Liveness* | Sus bucles aparecen como `<módulo>/<bucle>`; si un módulo atendido no está corriendo, la tarea se declara no viva | No aparece |
+| Métricas | Con la etiqueta `module` | No se publican |
+
+- `ZC_MODULES` es **obligatoria** fuera de desarrollo y pruebas, y un nombre que la aplicación
+  no contiene **impide arrancar**: una tarea sana que no atiende nada sería peor que una que
+  falla (`ActiveModules`).
+- La activación de cada *datasource* se deriva de `ZC_MODULES`
+  (`ModulesConfigSourceFactory`): no hay una segunda bandera que mantener en sincronía.
+- Al apagar, los módulos se detienen **a la vez y bajo un solo plazo**; uno tras otro
+  necesitarían el doble del tiempo que el orquestador concede (`ModuleLifecycle`).
+- `ZC_MODE=migrate` no arma ningún módulo: aplica las migraciones de todos, cada una con el rol
+  dueño de su esquema, y termina.
+
+### Qué separa a los módulos
+
+Compartir proceso no relaja ninguna frontera:
+
+| Frontera | Cómo se impone | Dónde se comprueba |
+|---|---|---|
+| Código | Ningún módulo importa a otro; la raíz solo conoce el contenedor de cada módulo; la librería interna no conoce ningún módulo | `ArchitectureTest` de cada módulo y `AppArchitectureTest` (ArchUnit) |
+| Datos | Cada módulo se conecta con su propio rol, que solo ve su esquema: leer el del otro responde `42501` | `AppSagaIT.sharingAProcessDoesNotShareTheDatabase`; `make e2e aislamiento` |
+| Transacciones | Una unidad de trabajo no puede abarcar dos módulos: el gestor de transacciones rechaza la segunda conexión | la misma prueba |
+| Comunicación | Solo eventos por SNS → SQS, también dentro del mismo proceso | `AppSagaIT`: la saga completa en un proceso, por el emulador |
+
+`AppArchitectureTest` comprueba además que todo módulo que existe en el código esté en la lista
+del contenedor raíz: un paquete olvidado se compilaría en la imagen sin que nadie lo atendiera.
 
 ## El hexágono
 
-Cada servicio contiene un dominio. Su código se organiza en seis paquetes con dependencias en
+Cada módulo contiene un dominio. Su código se organiza en seis paquetes con dependencias en
 un solo sentido:
 
 ```
-com.zonacards.<dominio>            agregados, objetos de valor, puertos, errores, requests
-com.zonacards.<dominio>.events     eventos que publica; vista propia de los que consume
-com.zonacards.<dominio>.srv        casos de uso y manejadores de eventos
-com.zonacards.<dominio>.infra      adaptadores de salida (PostgreSQL, cifrado)
-com.zonacards.<dominio>.api        adaptador de entrada (REST)
-com.zonacards.<dominio>.container  composición: crea e interconecta todo lo anterior
+com.zonacards.<módulo>            agregados, objetos de valor, puertos, errores, requests
+com.zonacards.<módulo>.events     eventos que publica; vista propia de los que consume
+com.zonacards.<módulo>.srv        casos de uso y manejadores de eventos
+com.zonacards.<módulo>.infra      adaptadores de salida (PostgreSQL, cifrado)
+com.zonacards.<módulo>.api        adaptador de entrada (REST)
+com.zonacards.<módulo>.container  composición: crea e interconecta todo lo anterior
 ```
 
 ```mermaid
@@ -32,11 +113,11 @@ flowchart LR
 | El dominio y `srv` dependen solo del JDK y de la parte sin framework de la librería interna (`kernel`, `errx`, `logx`, `ptrx`, `asyncx`, puertos de `eventx`) | Las reglas del negocio se prueban sin levantar nada y sobreviven a un cambio de framework |
 | `api` no conoce `infra` | La API habla con casos de uso, no con tablas |
 | Solo `container` conoce todas las piezas | El cableado se lee en un archivo, no se deduce de anotaciones |
-| Ningún dominio importa a otro | La única forma de llegar a otro dominio es un evento |
+| Ningún módulo importa a otro | La única forma de llegar a otro módulo es un evento |
 | No se usa `@Transactional`; la frontera es el puerto `UnitOfWork` | La transacción es explícita y visible en el caso de uso; JDBC fuera de ella falla en lugar de autoconfirmar |
 
-Estas reglas las comprueba `HexagonRules.check("com.zonacards.<dominio>", <otros dominios>)`
-(ArchUnit) en el `ArchitectureTest` de cada servicio, como lista de lo **permitido**: una
+Estas reglas las comprueba `HexagonRules.check("com.zonacards.<módulo>", <otros módulos>)`
+(ArchUnit) en el `ArchitectureTest` de cada módulo, como lista de lo **permitido**: una
 dependencia nueva que nadie previó falla el build. La propia regla tiene su prueba, con un
 paquete correcto y otro que la viola (`libs/testkit/.../HexagonRulesTest`).
 
@@ -72,10 +153,22 @@ public Lote anular(AuthContext auth, TenantId tenantId, LoteId id, String motivo
 
 ### Composición explícita
 
-`container/*Container` es una clase sin anotaciones de alcance que produce cada pieza con
-`@Produces @Singleton`. Ni el dominio ni los servicios llevan anotaciones de CDI: se construyen
-con `new`, con sus dependencias en el constructor. Quarkus resuelve el grafo en tiempo de
-compilación; un cableado incompleto falla al compilar, no al arrancar.
+`container/<Módulo>Container` es la única clase que conoce todas las piezas de su módulo. Su
+constructor se lee de arriba abajo: comprobación de lo que trae el despliegue, adaptadores,
+casos de uso, bucles de eventos. Todo se crea con `new`, con las dependencias en el
+constructor; ni el dominio ni los servicios llevan anotaciones de CDI.
+
+CDI solo entrega las piezas de la plataforma (el *datasource* del módulo, la unidad de trabajo,
+los clientes de AWS) y crea el contenedor **la primera vez que el módulo hace falta**. El
+contenedor raíz los recibe como `Instance<…>` precisamente por eso: en un despliegue que no
+atiende el módulo, su contenedor nunca se crea.
+
+```java
+// com.zonacards.app.AppContainer: agregar un módulo es agregar una línea
+return List.of(
+    AppModule.of(LotesContainer.MODULE, LotesContainer.API, () -> lotes.get().eventx()),
+    AppModule.of(GiftcardsContainer.MODULE, GiftcardsContainer.API, () -> giftcards.get().eventx()));
+```
 
 ## La librería interna
 
@@ -90,7 +183,7 @@ compilación; un cableado incompleto falla al compilar, no al arrancar.
 | `eventx` | Sobre CloudEvents, `Outbox`, `OutboxRelay`, `QueueConsumer`, `MessageDispatcher`, `Inbox`, registro de manejadores; adaptadores en memoria para pruebas | `kernel`, `asyncx`, Jackson |
 | `eventx-postgres` | *Outbox* e *inbox* sobre PostgreSQL | `eventx`, `dbx` |
 | `eventx-aws` | Publicación por SNS/SQS y recepción por SQS | `eventx`, AWS SDK v2 |
-| `server` | Lo único que conoce Quarkus: mapeo de errores a HTTP, `request_id`, `AuthContext` desde el JWT, `UnitOfWork` sobre JTA, ciclo de vida de `eventx`, *liveness*, métricas, trazas, punto de entrada con modo `migrate` | Quarkus |
+| `server` | Lo único que conoce Quarkus: qué módulos atiende el despliegue (`AppModule`, `ActiveModules`), su arranque con comprobación previa y su apagado, el `404` de un módulo no atendido, mapeo de errores a HTTP, `request_id`, `AuthContext` desde el JWT, `UnitOfWork` sobre JTA, *liveness* y métricas por módulo, trazas, punto de entrada con modo `migrate` | Quarkus |
 | `testkit` | `HexagonRules`, fixtures de PostgreSQL y del emulador, tokens de prueba, contratos de eventos, espía de eventos | Testcontainers, ArchUnit |
 
 ## De Manifesto (Go) a Java
@@ -103,8 +196,8 @@ compilación; un cableado incompleto falla al compilar, no al arrancar.
 | `pkg/ptrx` | `libs/ptrx` | Mínimo: en Java casi no hace falta |
 | `pkg/asyncx` | `libs/asyncx` | Solo lo que se usa |
 | `sqlx` | `libs/dbx` | SQL explícito, sin ORM |
-| `pkg/config` | `@ConfigMapping` por servicio | Tipado y sobrescribible por variables de entorno |
-| `cmd/server.go` y contenedores por módulo | `libs/server` + `container/*Container` | Composición explícita |
+| `pkg/config` | `@ConfigMapping` por módulo | Tipado y sobrescribible por variables de entorno |
+| `cmd/server.go` y contenedores por módulo | `libs/server` + `com.zonacards.app.AppContainer` + `container/*Container` | Composición explícita; un módulo se arma solo donde se atiende |
 | paquete raíz + `srv`, `infra`, `api`, `container` | igual | Fronteras verificadas con ArchUnit |
 | Convenciones `Get` / `Find` / `List` | `get` (falla si no existe), `find` (opcional), `list` (paginado) | |
 | `jobx` (cola sobre Redis) | no se porta | Lo reemplaza `eventx`, que sí es transaccional con la base |
@@ -121,7 +214,8 @@ autorización explícito y autorización antes del repositorio).
 mensaje, que es sobre lo que filtran las suscripciones de SNS.
 
 **Publicación (outbox).** `outbox.publish(topic, evento)` inserta una fila en la tabla `outbox`
-del servicio, en la transacción en curso. El *relay* de cada tarea:
+del esquema del módulo, en la transacción en curso. Cada tarea corre un *relay* por módulo que
+atiende, y cada *relay*:
 
 1. reclama un lote de filas pendientes con `FOR UPDATE SKIP LOCKED` y les pone un *lease*, en
    una transacción corta;
@@ -131,7 +225,9 @@ del servicio, en la transacción en curso. El *relay* de cada tarea:
    permanente, para que no bloqueen al resto.
 
 Varias tareas pueden correr el *relay* a la vez sin publicar dos veces la misma fila mientras
-el *lease* esté vigente; si una tarea muere con filas reclamadas, otra las toma al vencer.
+el *lease* esté vigente; si una tarea muere con filas reclamadas, otra las toma al vencer. Da
+igual que esas tareas sean del mismo servicio o de dos: durante una promoción el núcleo y el
+servicio propio corren el *relay* del mismo módulo sin coordinarse.
 
 **Consumo.** Un hilo por cola hace *long polling*. Antes de pedir mensajes toma cupos de un
 semáforo dimensionado contra el pool de conexiones, de modo que nunca tiene en memoria más
@@ -146,7 +242,12 @@ Mientras un mensaje se procesa, su *visibility timeout* se renueva. Si el maneja
 mensaje vuelve a la cola con espera creciente y, tras `maxReceiveCount` intentos, pasa a la DLQ.
 
 **Apagado.** Al recibir SIGTERM: se deja de pedir mensajes, lo recibido y no iniciado se
-devuelve a la cola, se espera a lo que está en curso y al final se detiene el *relay*.
+devuelve a la cola, se espera a lo que está en curso y al final se detiene el *relay*. Los
+módulos de una tarea lo hacen en paralelo, bajo un mismo plazo.
+
+**En el mismo proceso, igual.** Cuando `lotes` y `giftcards` comparten núcleo, un evento de uno
+al otro sale por el *outbox*, va al topic, llega a la cola y se consume como si vinieran de
+tareas distintas. No hay un atajo en memoria.
 
 **Garantía.** Al menos una vez, sin orden. Es lo que dan SNS y SQS estándar, y es lo único que
 el código asume.
@@ -154,12 +255,13 @@ el código asume.
 ## La saga de emisión
 
 `lotes` es dueño del lote y de su estado; `giftcards` es dueño de las gift cards. Ninguno
-espera al otro.
+espera al otro, y la saga es la misma compartan proceso o no: `AppSagaIT` la recorre con los dos
+módulos en un proceso, y `make e2e` en las dos topologías.
 
 1. `POST /lotes` guarda el lote en `SOLICITADO` y publica `lote-solicitado`.
 2. `giftcards` crea un **plan** y encola un comando `generar-fragmento` por cada fragmento del
    lote. Publica `generacion-iniciada`.
-3. Cualquier tarea de `giftcards` toma un fragmento: genera códigos y hashes **fuera** de la
+3. Cualquier tarea que atienda `giftcards` toma un fragmento: genera códigos y hashes **fuera** de la
    transacción (es CPU pura, en un pool de hilos de plataforma) y luego, en una transacción,
    inserta las gift cards y publica `fragmento-generado`.
 4. `lotes` registra cada fragmento; al completar el último pasa a `GENERADO` y publica
@@ -191,20 +293,25 @@ Dos decisiones de diseño que conviene conocer:
 
 ## Datos
 
-Una instancia PostgreSQL, un esquema por servicio, dos roles por servicio:
+Una instancia PostgreSQL, un esquema por módulo, dos roles por módulo:
 
 | Rol | Puede | Lo usa |
 |---|---|---|
-| `<servicio>_owner` | DDL sobre su esquema | solo la tarea de migración (Flyway) |
-| `<servicio>_app` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` sobre su esquema; con `CONNECTION LIMIT` | el servicio en ejecución |
+| `<módulo>_owner` | DDL sobre su esquema | solo la tarea de migración (Flyway) |
+| `<módulo>_app` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` sobre su esquema; con `CONNECTION LIMIT` | el *datasource* de ese módulo, en cualquier servicio que lo atienda |
 
 Los crea `deploy/db/bootstrap-service.sql`, el mismo script en las pruebas, en docker compose y
 en la tarea de *bootstrap* de AWS. `make e2e aislamiento` comprueba con los roles reales que un
-servicio no puede leer el esquema del otro ni alterar el suyo.
+módulo no puede leer el esquema del otro ni alterar el suyo.
+
+Cada módulo tiene su *datasource* con nombre (`quarkus.datasource.lotes`,
+`quarkus.datasource.giftcards`) y su propio *pool*. El límite de conexiones del rol se
+dimensiona para el momento de más demanda: una promoción en curso, con el núcleo y el servicio
+propio atendiendo el módulo a la vez (lo verifica Terraform).
 
 La misma imagen corre en dos modos: `serve` (por defecto) y `ZC_MODE=migrate`, que aplica las
-migraciones con el rol dueño y termina. El pipeline ejecuta la migración como tarea aparte antes
-de actualizar el servicio.
+migraciones de todos los módulos, cada una con el rol dueño de ese módulo, y termina. El
+pipeline la ejecuta como **una** tarea aparte antes de actualizar ningún servicio.
 
 ## Seguridad de los datos de la gift card
 
@@ -216,7 +323,8 @@ de actualizar el servicio.
 | CVV (3 dígitos) | `cvv_hash`: Argon2id con sal por tarjeta | Verificarlo sin poder recuperarlo |
 
 El código y el CVV en claro existen solo en la respuesta de la emisión unitaria. Las llaves son
-secretos de 32 bytes que el servicio valida al arrancar. El puerto `CodigoProtector` permite
+secretos de 32 bytes que el módulo valida al arrancar, y que solo recibe un despliegue que lo
+atiende. El puerto `CodigoProtector` permite
 sustituir el adaptador local por uno sobre KMS sin tocar el dominio.
 
 Dos límites conocidos: la emisión unitaria no es idempotente (un reintento emite otra tarjeta;
