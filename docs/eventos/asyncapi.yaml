@@ -1,0 +1,1658 @@
+asyncapi: 3.0.0
+
+info:
+  title: Zonacards - contrato de eventos entre lotes y giftcards
+  version: 1.0.0
+  description: |
+    Contrato de los mensajes que intercambian los servicios `lotes` y `giftcards` de Zonacards.
+    Los dos dominios no se llaman entre sí: se comunican solo por eventos.
+
+    - Cada servicio publica en su propio topic SNS: `lotes-events` y `giftcards-events`.
+    - Cada consumidor lee de su propia cola SQS (`giftcards-inbox`, `lotes-inbox`), suscrita al
+      topic del otro dominio con un filtro sobre el atributo de mensaje `type` y con entrega sin
+      envoltura (*raw message delivery*): el cuerpo que llega a la cola es el que publicó el
+      productor.
+    - Cada cola tiene su cola de mensajes muertos, `<cola>-dlq`.
+    - `giftcards` se envía además comandos a sí mismo por la cola `giftcards-generacion`. Ese
+      canal es **interno**: no forma parte del contrato público y aparece al final de cada
+      sección, separado y con la etiqueta `interno`.
+
+    **Formato.** Todo mensaje es un CloudEvents 1.0 en modo estructurado JSON (esquema
+    `EventEnvelope`) con tres atributos de extensión: `tenantid`, `correlationid` y
+    `traceparent`. El tipo y el tenant viajan además como atributos de mensaje de SNS/SQS
+    (`type`, `tenantid`).
+
+    **Entrega.** Al menos una vez y sin orden. Un mismo evento puede llegar repetido, y dos
+    eventos pueden llegar en un orden distinto al de emisión. Los consumidores deduplican por
+    `id` y están escritos para que el resultado no dependa del orden de llegada.
+
+    **Evolución.** Dentro de `v1` solo hay cambios aditivos. Los lectores ignoran los atributos y
+    campos que no conocen; por eso ningún esquema de este documento cierra
+    `additionalProperties`. Un cambio incompatible es un tipo nuevo terminado en `.v2`, publicado
+    en paralelo con el anterior.
+
+    **Nombres.** Los canales usan los nombres lógicos del código y de Terraform. El nombre
+    físico en AWS es `zonacards-<entorno>-<nombre lógico>` (por ejemplo
+    `zonacards-dev-lotes-events`); cada servicio recibe por configuración el ARN o la URL de lo
+    que usa.
+
+    **Ejemplos.** El ejemplo de cada evento es una copia de `docs/eventos/ejemplos/<type>.json`.
+    Esos archivos son normativos: las pruebas del productor y del consumidor se ejecutan contra
+    ellos.
+
+    La explicación completa está en `README.md`, en esta misma carpeta.
+  tags:
+    - $ref: '#/components/tags/giftcards'
+    - $ref: '#/components/tags/interno'
+    - $ref: '#/components/tags/lotes'
+
+defaultContentType: application/json
+
+servers:
+  sns:
+    host: 'sns.{region}.amazonaws.com'
+    protocol: sns
+    title: Amazon SNS
+    description: >-
+      Topics SNS estándar en los que cada dominio publica sus eventos. Los servicios publican
+      contra el ARN que reciben por configuración. En el entorno local el mismo conjunto de
+      topics y colas se crea en un emulador (`infra/terraform/local`) y los servicios apuntan a
+      él con `ZC_AWS_ENDPOINT`.
+    variables:
+      region:
+        $ref: '#/components/serverVariables/region'
+  sqs:
+    host: 'sqs.{region}.amazonaws.com'
+    protocol: sqs
+    title: Amazon SQS
+    description: >-
+      Colas SQS estándar de las que consume cada servicio, cada una con su cola de mensajes
+      muertos. Los servicios consumen de la URL que reciben por configuración.
+    variables:
+      region:
+        $ref: '#/components/serverVariables/region'
+
+channels:
+  # ---------------------------------------------------------------------------------------------
+  # Topics: un topic por dominio que publica.
+  # ---------------------------------------------------------------------------------------------
+  lotes-events:
+    address: lotes-events
+    title: Topic SNS lotes-events
+    summary: Eventos públicos del dominio lotes.
+    description: |
+      Topic SNS estándar (sin orden) en el que `lotes-service` publica sus eventos. Es su único
+      publicador. Nombre físico `zonacards-<entorno>-lotes-events`; el servicio recibe el ARN en
+      `ZC_TOPIC_LOTES_EVENTS_ARN`.
+
+      Tiene una suscripción: la cola `giftcards-inbox`, filtrada por el atributo de mensaje
+      `type` (ver el binding `sns` de las operaciones de publicación). `lote-generado` y
+      `lote-fallido` no figuran en ese filtro: se publican, pero hoy ninguna cola de este
+      repositorio los recibe.
+    servers:
+      - $ref: '#/servers/sns'
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      LoteSolicitado:
+        $ref: '#/components/messages/LoteSolicitado'
+      LoteAnulado:
+        $ref: '#/components/messages/LoteAnulado'
+      LoteGenerado:
+        $ref: '#/components/messages/LoteGenerado'
+      LoteFallido:
+        $ref: '#/components/messages/LoteFallido'
+    bindings:
+      sns:
+        name: lotes-events
+        ordering:
+          type: standard
+        bindingVersion: 0.1.0
+
+  giftcards-events:
+    address: giftcards-events
+    title: Topic SNS giftcards-events
+    summary: Eventos públicos del dominio giftcards.
+    description: |
+      Topic SNS estándar (sin orden) en el que `giftcards-service` publica sus eventos. Es su
+      único publicador. Nombre físico `zonacards-<entorno>-giftcards-events`; el servicio recibe
+      el ARN en `ZC_TOPIC_GIFTCARDS_EVENTS_ARN`.
+
+      Tiene una suscripción: la cola `lotes-inbox`, filtrada por el atributo de mensaje `type`
+      (ver el binding `sns` de las operaciones de publicación). `giftcard-emitida`,
+      `giftcard-activada` y `giftcard-anulada` no figuran en ese filtro: se publican, pero hoy
+      ninguna cola de este repositorio los recibe.
+    servers:
+      - $ref: '#/servers/sns'
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      GeneracionIniciada:
+        $ref: '#/components/messages/GeneracionIniciada'
+      FragmentoGenerado:
+        $ref: '#/components/messages/FragmentoGenerado'
+      FragmentoFallido:
+        $ref: '#/components/messages/FragmentoFallido'
+      LoteAnuladoAplicado:
+        $ref: '#/components/messages/LoteAnuladoAplicado'
+      GiftCardEmitida:
+        $ref: '#/components/messages/GiftCardEmitida'
+      GiftCardActivada:
+        $ref: '#/components/messages/GiftCardActivada'
+      GiftCardAnulada:
+        $ref: '#/components/messages/GiftCardAnulada'
+    bindings:
+      sns:
+        name: giftcards-events
+        ordering:
+          type: standard
+        bindingVersion: 0.1.0
+
+  # ---------------------------------------------------------------------------------------------
+  # Colas de entrada: una por consumidor, suscrita al topic del otro dominio.
+  # ---------------------------------------------------------------------------------------------
+  giftcards-inbox:
+    address: giftcards-inbox
+    title: Cola SQS giftcards-inbox
+    summary: Lo que giftcards necesita oír de lotes.
+    description: |
+      Cola SQS estándar de la que consume `giftcards-service`. Está suscrita al topic
+      `lotes-events` con un filtro sobre el atributo de mensaje `type` (alcance
+      `MessageAttributes`) que solo deja pasar `zonacards.lotes.lote-solicitado.v1` y
+      `zonacards.lotes.lote-anulado.v1`. La entrega es sin envoltura: el cuerpo es el sobre
+      CloudEvents tal como lo publicó `lotes` y los atributos de mensaje se conservan.
+
+      - La política de la cola solo admite `sqs:SendMessage` del servicio SNS cuando el origen
+        es el topic `lotes-events` (no cabe en el binding `sqs` 0.2.0, que no modela
+        condiciones).
+      - Tiempo de visibilidad de 60 s; el consumidor lo renueva mientras el handler sigue en
+        curso. Espera de lectura (*long polling*) de 20 s. Retención de 4 días.
+      - Un mensaje recibido 5 veces sin confirmarse pasa a `giftcards-inbox-dlq`, que lo retiene
+        14 días.
+      - Nombre físico `zonacards-<entorno>-giftcards-inbox`; el servicio recibe la URL en
+        `ZC_QUEUE_GIFTCARDS_INBOX_URL`.
+    servers:
+      - $ref: '#/servers/sqs'
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      LoteSolicitado:
+        $ref: '#/components/messages/LoteSolicitado'
+      LoteAnulado:
+        $ref: '#/components/messages/LoteAnulado'
+    bindings:
+      sqs:
+        queue:
+          name: giftcards-inbox
+          fifoQueue: false
+          visibilityTimeout: 60
+          receiveMessageWaitTime: 20
+          messageRetentionPeriod: 345600
+          redrivePolicy:
+            deadLetterQueue:
+              name: giftcards-inbox-dlq
+            maxReceiveCount: 5
+        deadLetterQueue:
+          name: giftcards-inbox-dlq
+          fifoQueue: false
+          receiveMessageWaitTime: 20
+          messageRetentionPeriod: 1209600
+        bindingVersion: 0.2.0
+
+  lotes-inbox:
+    address: lotes-inbox
+    title: Cola SQS lotes-inbox
+    summary: Lo que lotes necesita oír de giftcards.
+    description: |
+      Cola SQS estándar de la que consume `lotes-service`. Está suscrita al topic
+      `giftcards-events` con un filtro sobre el atributo de mensaje `type` (alcance
+      `MessageAttributes`) que solo deja pasar `zonacards.giftcards.generacion-iniciada.v1`,
+      `zonacards.giftcards.fragmento-generado.v1`, `zonacards.giftcards.fragmento-fallido.v1` y
+      `zonacards.giftcards.lote-anulado-aplicado.v1`. La entrega es sin envoltura: el cuerpo es el
+      sobre CloudEvents tal como lo publicó `giftcards` y los atributos de mensaje se conservan.
+
+      - La política de la cola solo admite `sqs:SendMessage` del servicio SNS cuando el origen
+        es el topic `giftcards-events` (no cabe en el binding `sqs` 0.2.0, que no modela
+        condiciones).
+      - Tiempo de visibilidad de 60 s; el consumidor lo renueva mientras el handler sigue en
+        curso. Espera de lectura (*long polling*) de 20 s. Retención de 4 días.
+      - Un mensaje recibido 5 veces sin confirmarse pasa a `lotes-inbox-dlq`, que lo retiene
+        14 días.
+      - Nombre físico `zonacards-<entorno>-lotes-inbox`; el servicio recibe la URL en
+        `ZC_QUEUE_LOTES_INBOX_URL`.
+    servers:
+      - $ref: '#/servers/sqs'
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      GeneracionIniciada:
+        $ref: '#/components/messages/GeneracionIniciada'
+      FragmentoGenerado:
+        $ref: '#/components/messages/FragmentoGenerado'
+      FragmentoFallido:
+        $ref: '#/components/messages/FragmentoFallido'
+      LoteAnuladoAplicado:
+        $ref: '#/components/messages/LoteAnuladoAplicado'
+    bindings:
+      sqs:
+        queue:
+          name: lotes-inbox
+          fifoQueue: false
+          visibilityTimeout: 60
+          receiveMessageWaitTime: 20
+          messageRetentionPeriod: 345600
+          redrivePolicy:
+            deadLetterQueue:
+              name: lotes-inbox-dlq
+            maxReceiveCount: 5
+        deadLetterQueue:
+          name: lotes-inbox-dlq
+          fifoQueue: false
+          receiveMessageWaitTime: 20
+          messageRetentionPeriod: 1209600
+        bindingVersion: 0.2.0
+
+  # ---------------------------------------------------------------------------------------------
+  # INTERNO. Cola de trabajo de giftcards. No es parte del contrato público.
+  # ---------------------------------------------------------------------------------------------
+  giftcards-generacion:
+    address: giftcards-generacion
+    title: INTERNO - cola SQS giftcards-generacion
+    summary: Cola de trabajo interna de giftcards. Fuera del contrato público.
+    description: |
+      **Canal interno del dominio giftcards.** Ningún otro servicio debe publicar ni consumir
+      aquí, y su mensaje puede cambiar junto con el código de `giftcards-service` sin las reglas
+      de versionado de los eventos públicos.
+
+      Cola SQS estándar sin suscripción a ningún topic: `giftcards-service` envía directamente a
+      ella los comandos `generar-fragmento` (uno por fragmento de un lote) y él mismo los
+      consume. Cualquier tarea del servicio puede tomar cualquier fragmento; la profundidad de
+      esta cola es la señal con la que el servicio escala.
+
+      - Tiempo de visibilidad de 300 s, porque generar un fragmento es intensivo en CPU; el
+        consumidor lo renueva mientras el fragmento sigue en curso. Espera de lectura de 20 s.
+        Retención de 4 días.
+      - Un mensaje recibido 5 veces sin confirmarse pasa a `giftcards-generacion-dlq`, que lo
+        retiene 14 días.
+      - Nombre físico `zonacards-<entorno>-giftcards-generacion`; el servicio recibe la URL en
+        `ZC_QUEUE_GIFTCARDS_GENERACION_URL`.
+    servers:
+      - $ref: '#/servers/sqs'
+    tags:
+      - $ref: '#/components/tags/giftcards'
+      - $ref: '#/components/tags/interno'
+    messages:
+      GenerarFragmento:
+        $ref: '#/components/messages/GenerarFragmento'
+    bindings:
+      sqs:
+        queue:
+          name: giftcards-generacion
+          fifoQueue: false
+          visibilityTimeout: 300
+          receiveMessageWaitTime: 20
+          messageRetentionPeriod: 345600
+          redrivePolicy:
+            deadLetterQueue:
+              name: giftcards-generacion-dlq
+            maxReceiveCount: 5
+        deadLetterQueue:
+          name: giftcards-generacion-dlq
+          fifoQueue: false
+          receiveMessageWaitTime: 20
+          messageRetentionPeriod: 1209600
+        bindingVersion: 0.2.0
+
+operations:
+  # ---------------------------------------------------------------------------------------------
+  # lotes publica en lotes-events
+  # ---------------------------------------------------------------------------------------------
+  lotesPublicaLoteSolicitado:
+    action: send
+    channel:
+      $ref: '#/channels/lotes-events'
+    title: lotes publica lote-solicitado
+    summary: lotes-service publica zonacards.lotes.lote-solicitado.v1 al aceptar un lote nuevo.
+    description: |
+      `LoteService.crear`. El evento se escribe en el outbox en la misma transacción que crea el
+      lote. Un reintento con la misma `Idempotency-Key` devuelve el lote ya creado y no publica
+      un segundo evento.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-events/messages/LoteSolicitado'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnLotesEvents'
+
+  lotesPublicaLoteAnulado:
+    action: send
+    channel:
+      $ref: '#/channels/lotes-events'
+    title: lotes publica lote-anulado
+    summary: lotes-service publica zonacards.lotes.lote-anulado.v1 la primera vez que se anula un lote.
+    description: |
+      `LoteService.anular`. Un lote puede anularse en cualquier estado: antes, durante o después
+      de la generación. Anular un lote que ya estaba anulado no publica nada.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-events/messages/LoteAnulado'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnLotesEvents'
+
+  lotesPublicaLoteGenerado:
+    action: send
+    channel:
+      $ref: '#/channels/lotes-events'
+    title: lotes publica lote-generado
+    summary: lotes-service publica zonacards.lotes.lote-generado.v1 al registrar el último fragmento.
+    description: |
+      `LoteEventHandlers.onFragmentoGenerado`. Cuando el fragmento registrado completa el total,
+      el lote pasa a `GENERADO` y el evento se publica en la misma transacción. Una vez por lote.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-events/messages/LoteGenerado'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnLotesEvents'
+
+  lotesPublicaLoteFallido:
+    action: send
+    channel:
+      $ref: '#/channels/lotes-events'
+    title: lotes publica lote-fallido
+    summary: lotes-service publica zonacards.lotes.lote-fallido.v1 cuando la generación no puede completarse.
+    description: |
+      `LoteEventHandlers.onFragmentoFallido`. Cuando un `fragmento-fallido` lleva a `FALLIDO` un
+      lote que no estaba en estado terminal. Si el lote ya era terminal no se publica nada.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-events/messages/LoteFallido'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnLotesEvents'
+
+  # ---------------------------------------------------------------------------------------------
+  # giftcards publica en giftcards-events
+  # ---------------------------------------------------------------------------------------------
+  giftcardsPublicaGeneracionIniciada:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica generacion-iniciada
+    summary: giftcards-service publica zonacards.giftcards.generacion-iniciada.v1 al planificar un lote.
+    description: |
+      `GeneracionHandlers.onLoteSolicitado`. El plan, los comandos de fragmento y este evento se
+      confirman en la misma transacción. No se publica si el lote ya tenía plan (reentrega de la
+      solicitud) o si su anulación llegó antes.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/GeneracionIniciada'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  giftcardsPublicaFragmentoGenerado:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica fragmento-generado
+    summary: giftcards-service publica zonacards.giftcards.fragmento-generado.v1 al guardar un fragmento.
+    description: |
+      `GeneracionHandlers.onGenerarFragmento` (paso `guardar`). Se publica en la misma
+      transacción que guarda las gift cards del fragmento. Hay un evento por fragmento, no uno
+      por gift card.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/FragmentoGenerado'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  giftcardsPublicaFragmentoFallido:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica fragmento-fallido
+    summary: giftcards-service publica zonacards.giftcards.fragmento-fallido.v1 cuando un fragmento no puede generarse.
+    description: |
+      `GeneracionHandlers.onGenerarFragmento` (paso `fallar`). Solo para fallos que reintentar no
+      resolvería, por ejemplo no encontrar códigos únicos tras 5 rondas de reemplazo. El plan
+      queda `FALLIDO` y los demás fragmentos dejan de generarse. Un fallo transitorio no produce
+      este evento: el comando se reentrega.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/FragmentoFallido'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  giftcardsPublicaLoteAnuladoAplicado:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica lote-anulado-aplicado
+    summary: giftcards-service publica zonacards.giftcards.lote-anulado-aplicado.v1 al anular el plan y las gift cards de un lote.
+    description: |
+      `GeneracionHandlers.onLoteAnulado`. Se publica en la misma transacción que anula el plan y
+      las gift cards que existían. No se publica si el plan ya estaba anulado.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/LoteAnuladoAplicado'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  giftcardsPublicaGiftCardEmitida:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica giftcard-emitida
+    summary: giftcards-service publica zonacards.giftcards.giftcard-emitida.v1 al emitir una gift card individual.
+    description: |
+      `GiftCardService.emitir`. Solo para la emisión individual por la API. Las gift cards
+      generadas dentro de un lote no producen este evento: su avance se anuncia por fragmento.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/GiftCardEmitida'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  giftcardsPublicaGiftCardActivada:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica giftcard-activada
+    summary: giftcards-service publica zonacards.giftcards.giftcard-activada.v1 al activar una gift card.
+    description: |
+      `GiftCardService.activar`. Activar una gift card que ya estaba activa no publica nada.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/GiftCardActivada'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  giftcardsPublicaGiftCardAnulada:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-events'
+    title: giftcards publica giftcard-anulada
+    summary: giftcards-service publica zonacards.giftcards.giftcard-anulada.v1 al anular una gift card individual.
+    description: |
+      `GiftCardService.anular`. Anular una gift card ya anulada no publica nada. La anulación en
+      bloque por anulación de lote no produce este evento: se anuncia con
+      `lote-anulado-aplicado`.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-events/messages/GiftCardAnulada'
+    bindings:
+      $ref: '#/components/operationBindings/PublicacionEnGiftcardsEvents'
+
+  # ---------------------------------------------------------------------------------------------
+  # giftcards consume de giftcards-inbox
+  # ---------------------------------------------------------------------------------------------
+  giftcardsRecibeLoteSolicitado:
+    action: receive
+    channel:
+      $ref: '#/channels/giftcards-inbox'
+    title: giftcards recibe lote-solicitado
+    summary: giftcards-service planifica la generación del lote.
+    description: |
+      `GeneracionHandlers.onLoteSolicitado`. Guarda un plan y divide el trabajo en fragmentos:
+      envía un comando `generar-fragmento` por fragmento a su cola interna y publica
+      `generacion-iniciada`, todo en una transacción junto con el registro de deduplicación.
+
+      El plan se inserta con `ON CONFLICT DO NOTHING`: una segunda entrega lo encuentra y no hace
+      nada, igual que una solicitud que llega después de su propia anulación.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-inbox/messages/LoteSolicitado'
+
+  giftcardsRecibeLoteAnulado:
+    action: receive
+    channel:
+      $ref: '#/channels/giftcards-inbox'
+    title: giftcards recibe lote-anulado
+    summary: giftcards-service detiene el plan y anula las gift cards generadas.
+    description: |
+      `GeneracionHandlers.onLoteAnulado`. Anula el plan, anula en la misma transacción las gift
+      cards del lote que ya existían y publica `lote-anulado-aplicado`.
+
+      Si la solicitud del lote todavía no llegó, deja el plan creado ya anulado (una lápida) para
+      que la solicitud tardía no genere nada. Si el plan ya estaba anulado, o es de otro tenant,
+      no hace nada.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+    messages:
+      - $ref: '#/channels/giftcards-inbox/messages/LoteAnulado'
+
+  # ---------------------------------------------------------------------------------------------
+  # lotes consume de lotes-inbox
+  # ---------------------------------------------------------------------------------------------
+  lotesRecibeGeneracionIniciada:
+    action: receive
+    channel:
+      $ref: '#/channels/lotes-inbox'
+    title: lotes recibe generacion-iniciada
+    summary: lotes-service marca el lote como en generación.
+    description: |
+      `LoteEventHandlers.onGeneracionIniciada`. Pasa el lote de `SOLICITADO` a `EN_GENERACION` y
+      anota el total de fragmentos. En cualquier otro estado no cambia nada: este evento puede
+      llegar después de los primeros fragmentos, o repetido.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-inbox/messages/GeneracionIniciada'
+
+  lotesRecibeFragmentoGenerado:
+    action: receive
+    channel:
+      $ref: '#/channels/lotes-inbox'
+    title: lotes recibe fragmento-generado
+    summary: lotes-service registra el avance y, con el último fragmento, da el lote por generado.
+    description: |
+      `LoteEventHandlers.onFragmentoGenerado`. Registra el número de fragmento en un conjunto
+      (tabla `lote_fragmento`, clave `lote_id` + `fragmento`): un fragmento cuenta una sola vez
+      aunque su evento llegue varias. El total de fragmentos se toma del propio evento, así que
+      funciona aunque `generacion-iniciada` no haya llegado. Con el último fragmento el lote pasa
+      a `GENERADO` y se publica `lote-generado`.
+
+      Si el lote ya está en estado terminal (`ANULADO`, `FALLIDO`, `GENERADO`), el evento se
+      confirma y se ignora.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-inbox/messages/FragmentoGenerado'
+
+  lotesRecibeFragmentoFallido:
+    action: receive
+    channel:
+      $ref: '#/channels/lotes-inbox'
+    title: lotes recibe fragmento-fallido
+    summary: lotes-service da el lote por fallido.
+    description: |
+      `LoteEventHandlers.onFragmentoFallido`. Pasa el lote a `FALLIDO` con el motivo
+      `Fragmento <n>: <motivo>` y publica `lote-fallido`. Si el lote ya estaba en estado terminal
+      no cambia nada ni publica.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-inbox/messages/FragmentoFallido'
+
+  lotesRecibeLoteAnuladoAplicado:
+    action: receive
+    channel:
+      $ref: '#/channels/lotes-inbox'
+    title: lotes recibe lote-anulado-aplicado
+    summary: lotes-service anota que giftcards aplicó la anulación.
+    description: |
+      `LoteEventHandlers.onAnulacionAplicada`. Anota en el lote anulado cuándo se aplicó la
+      anulación y cuántas gift cards se anularon. Solo la primera vez: si ya estaba anotado no
+      cambia nada.
+    tags:
+      - $ref: '#/components/tags/lotes'
+    messages:
+      - $ref: '#/channels/lotes-inbox/messages/LoteAnuladoAplicado'
+
+  # ---------------------------------------------------------------------------------------------
+  # INTERNO. giftcards se envía comandos a sí mismo. No es parte del contrato público.
+  # ---------------------------------------------------------------------------------------------
+  giftcardsEnviaGenerarFragmento:
+    action: send
+    channel:
+      $ref: '#/channels/giftcards-generacion'
+    title: INTERNO - giftcards envía generar-fragmento
+    summary: giftcards-service reparte el trabajo de un lote en su propia cola.
+    description: |
+      **Operación interna del dominio giftcards.** `GeneracionHandlers.onLoteSolicitado`
+      (`outbox.sendAll`): un comando por fragmento, escrito en el outbox en la misma transacción
+      que el plan. Va directo a la cola, no a un topic.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+      - $ref: '#/components/tags/interno'
+    messages:
+      - $ref: '#/channels/giftcards-generacion/messages/GenerarFragmento'
+
+  giftcardsEjecutaGenerarFragmento:
+    action: receive
+    channel:
+      $ref: '#/channels/giftcards-generacion'
+    title: INTERNO - giftcards ejecuta generar-fragmento
+    summary: giftcards-service genera las gift cards de un fragmento.
+    description: |
+      **Operación interna del dominio giftcards.** `GeneracionHandlers.onGenerarFragmento`, en
+      tres pasos:
+
+      1. Una consulta barata al plan, para saltarse el trabajo que ya no hace falta (plan
+         desconocido o de otro tenant, plan detenido, fragmento que ya no está pendiente).
+      2. La parte cara (códigos, cifrado, un hash de CVV por gift card) sin transacción ni
+         conexión a la base de datos.
+      3. Una transacción corta que lo guarda todo, protegida dos veces: un bloqueo compartido
+         sobre el plan (una anulación en curso espera; una ya confirmada detiene el fragmento) y
+         una actualización condicional del fragmento (una entrega concurrente o posterior del
+         mismo comando no guarda nada).
+
+      Resultado: `fragmento-generado`, o `fragmento-fallido` si el fragmento no puede generarse.
+      Si la tarea muere antes de confirmar, no se guardó nada y el comando vuelve a la cola.
+    tags:
+      - $ref: '#/components/tags/giftcards'
+      - $ref: '#/components/tags/interno'
+    messages:
+      - $ref: '#/channels/giftcards-generacion/messages/GenerarFragmento'
+
+components:
+  tags:
+    giftcards:
+      name: giftcards
+      description: Dominio giftcards (`giftcards-service`).
+    interno:
+      name: interno
+      description: >-
+        Mensajería interna de un dominio. No es parte del contrato público: puede cambiar con el
+        código del servicio que la usa.
+    lotes:
+      name: lotes
+      description: Dominio lotes (`lotes-service`).
+
+  serverVariables:
+    region:
+      default: us-east-1
+      description: >-
+        Región de AWS del entorno. `us-east-1` en dev, qa y prod
+        (`infra/terraform/envs/*/terraform.tfvars`).
+
+  # ---------------------------------------------------------------------------------------------
+  # Suscripciones SNS -> SQS, tal como las crea infra/terraform/modules/messaging a partir de
+  # infra/terraform/modules/messaging/topology/outputs.tf.
+  # ---------------------------------------------------------------------------------------------
+  operationBindings:
+    PublicacionEnLotesEvents:
+      sns:
+        topic:
+          name: lotes-events
+        consumers:
+          - protocol: sqs
+            endpoint:
+              name: giftcards-inbox
+            filterPolicy:
+              type:
+                - zonacards.lotes.lote-solicitado.v1
+                - zonacards.lotes.lote-anulado.v1
+            filterPolicyScope: MessageAttributes
+            rawMessageDelivery: true
+        bindingVersion: 0.1.0
+      sqs:
+        queues:
+          - $ref: '#/channels/giftcards-inbox/bindings/sqs/queue'
+          - $ref: '#/channels/giftcards-inbox/bindings/sqs/deadLetterQueue'
+        bindingVersion: 0.2.0
+
+    PublicacionEnGiftcardsEvents:
+      sns:
+        topic:
+          name: giftcards-events
+        consumers:
+          - protocol: sqs
+            endpoint:
+              name: lotes-inbox
+            filterPolicy:
+              type:
+                - zonacards.giftcards.generacion-iniciada.v1
+                - zonacards.giftcards.fragmento-generado.v1
+                - zonacards.giftcards.fragmento-fallido.v1
+                - zonacards.giftcards.lote-anulado-aplicado.v1
+            filterPolicyScope: MessageAttributes
+            rawMessageDelivery: true
+        bindingVersion: 0.1.0
+      sqs:
+        queues:
+          - $ref: '#/channels/lotes-inbox/bindings/sqs/queue'
+          - $ref: '#/channels/lotes-inbox/bindings/sqs/deadLetterQueue'
+        bindingVersion: 0.2.0
+
+  messageTraits:
+    CloudEvent:
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MessageAttributes'
+      correlationId:
+        description: >-
+          Atributo de extensión `correlationid` del sobre: el mismo valor en todos los mensajes
+          causados por una misma petición, en los dos dominios.
+        location: '$message.payload#/correlationid'
+
+  messages:
+    # --- lotes ---------------------------------------------------------------------------------
+    LoteSolicitado:
+      name: zonacards.lotes.lote-solicitado.v1
+      title: Lote solicitado
+      summary: Se aceptó la solicitud de generar un lote de gift cards.
+      description: |
+        Lleva todo lo que `giftcards` necesita para generar el lote sin consultar a `lotes`:
+        país, moneda, monto, cantidad y vigencia. `subject` es el `loteId`.
+      tags:
+        - $ref: '#/components/tags/lotes'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.lotes.lote-solicitado.v1
+              source:
+                const: /zonacards/lotes
+              data:
+                $ref: '#/components/schemas/LoteSolicitado'
+      examples:
+        - name: zonacards.lotes.lote-solicitado.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.lotes.lote-solicitado.v1.json
+          headers:
+            type: zonacards.lotes.lote-solicitado.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/lotes
+            type: zonacards.lotes.lote-solicitado.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              pais: '604'
+              moneda: PEN
+              monto: 50.00
+              cantidad: 5000
+              vigenciaHasta: '2027-12-31'
+
+    LoteAnulado:
+      name: zonacards.lotes.lote-anulado.v1
+      title: Lote anulado
+      summary: Se anuló un lote; sus gift cards deben anularse.
+      description: |
+        Se emite una vez por lote, sea cual sea su estado al anularlo. `subject` es el `loteId`.
+      tags:
+        - $ref: '#/components/tags/lotes'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.lotes.lote-anulado.v1
+              source:
+                const: /zonacards/lotes
+              data:
+                $ref: '#/components/schemas/LoteAnulado'
+      examples:
+        - name: zonacards.lotes.lote-anulado.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.lotes.lote-anulado.v1.json
+          headers:
+            type: zonacards.lotes.lote-anulado.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/lotes
+            type: zonacards.lotes.lote-anulado.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              motivo: Campaña cancelada
+
+    LoteGenerado:
+      name: zonacards.lotes.lote-generado.v1
+      title: Lote generado
+      summary: Todas las gift cards del lote fueron generadas.
+      description: |
+        Se emite una vez, cuando `lotes` registra el último fragmento. `subject` es el `loteId`.
+        Hoy ninguna cola de este repositorio está suscrita a este tipo.
+      tags:
+        - $ref: '#/components/tags/lotes'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.lotes.lote-generado.v1
+              source:
+                const: /zonacards/lotes
+              data:
+                $ref: '#/components/schemas/LoteGenerado'
+      examples:
+        - name: zonacards.lotes.lote-generado.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.lotes.lote-generado.v1.json
+          headers:
+            type: zonacards.lotes.lote-generado.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/lotes
+            type: zonacards.lotes.lote-generado.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              cantidad: 5000
+
+    LoteFallido:
+      name: zonacards.lotes.lote-fallido.v1
+      title: Lote fallido
+      summary: La generación del lote no puede completarse.
+      description: |
+        Se emite cuando un fragmento fallido lleva el lote a `FALLIDO`. `subject` es el `loteId`.
+        Hoy ninguna cola de este repositorio está suscrita a este tipo.
+      tags:
+        - $ref: '#/components/tags/lotes'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.lotes.lote-fallido.v1
+              source:
+                const: /zonacards/lotes
+              data:
+                $ref: '#/components/schemas/LoteFallido'
+      examples:
+        - name: zonacards.lotes.lote-fallido.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.lotes.lote-fallido.v1.json
+          headers:
+            type: zonacards.lotes.lote-fallido.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/lotes
+            type: zonacards.lotes.lote-fallido.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              motivo: 'Fragmento 3: no se pudo generar'
+
+    # --- giftcards -----------------------------------------------------------------------------
+    GeneracionIniciada:
+      name: zonacards.giftcards.generacion-iniciada.v1
+      title: Generación iniciada
+      summary: giftcards planificó la generación de un lote y la dividió en fragmentos.
+      description: |
+        Se emite una vez por lote, al crear el plan. `subject` es el `loteId`. Puede llegar
+        después de los primeros `fragmento-generado`.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.generacion-iniciada.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/GeneracionIniciada'
+      examples:
+        - name: zonacards.giftcards.generacion-iniciada.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.generacion-iniciada.v1.json
+          headers:
+            type: zonacards.giftcards.generacion-iniciada.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.generacion-iniciada.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              totalFragmentos: 5
+
+    FragmentoGenerado:
+      name: zonacards.giftcards.fragmento-generado.v1
+      title: Fragmento generado
+      summary: Se generaron y guardaron las gift cards de un fragmento del lote.
+      description: |
+        Un evento por fragmento, no uno por gift card. Los fragmentos de un lote se generan en
+        paralelo y sus eventos llegan en cualquier orden. `subject` es el `loteId`.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.fragmento-generado.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/FragmentoGenerado'
+      examples:
+        - name: zonacards.giftcards.fragmento-generado.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.fragmento-generado.v1.json
+          headers:
+            type: zonacards.giftcards.fragmento-generado.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.fragmento-generado.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              fragmento: 1
+              totalFragmentos: 5
+              cantidad: 1000
+
+    FragmentoFallido:
+      name: zonacards.giftcards.fragmento-fallido.v1
+      title: Fragmento fallido
+      summary: Un fragmento del lote no puede generarse; giftcards abandona el resto del lote.
+      description: |
+        Fallo definitivo: reintentar no lo resolvería. De ese fragmento no quedó guardada ninguna
+        gift card. `subject` es el `loteId`.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.fragmento-fallido.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/FragmentoFallido'
+      examples:
+        - name: zonacards.giftcards.fragmento-fallido.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.fragmento-fallido.v1.json
+          headers:
+            type: zonacards.giftcards.fragmento-fallido.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.fragmento-fallido.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              fragmento: 3
+              motivo: no se pudo generar
+
+    LoteAnuladoAplicado:
+      name: zonacards.giftcards.lote-anulado-aplicado.v1
+      title: Anulación de lote aplicada
+      summary: giftcards detuvo la generación del lote y anuló las gift cards que existían.
+      description: |
+        Confirmación de `lote-anulado`. Se emite una vez por lote. `subject` es el `loteId`.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.lote-anulado-aplicado.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/LoteAnuladoAplicado'
+      examples:
+        - name: zonacards.giftcards.lote-anulado-aplicado.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.lote-anulado-aplicado.v1.json
+          headers:
+            type: zonacards.giftcards.lote-anulado-aplicado.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.lote-anulado-aplicado.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              giftcardsAnuladas: 3000
+
+    GiftCardEmitida:
+      name: zonacards.giftcards.giftcard-emitida.v1
+      title: Gift card emitida
+      summary: Se emitió una gift card individual, fuera de un lote.
+      description: |
+        Nunca incluye el código ni el CVV. `subject` es el `giftCardId`. Hoy ninguna cola de este
+        repositorio está suscrita a este tipo.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.giftcard-emitida.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/GiftCardEmitida'
+      examples:
+        - name: zonacards.giftcards.giftcard-emitida.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.giftcard-emitida.v1.json
+          headers:
+            type: zonacards.giftcards.giftcard-emitida.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.giftcard-emitida.v1
+            subject: 019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              giftCardId: 019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52
+              pais: '604'
+              moneda: PEN
+              monto: 50.00
+              vigenciaHasta: '2027-12-31'
+
+    GiftCardActivada:
+      name: zonacards.giftcards.giftcard-activada.v1
+      title: Gift card activada
+      summary: Una gift card pasó de GENERADA a ACTIVA.
+      description: |
+        `subject` es el `giftCardId`. Hoy ninguna cola de este repositorio está suscrita a este
+        tipo.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.giftcard-activada.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/GiftCardActivada'
+      examples:
+        - name: zonacards.giftcards.giftcard-activada.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.giftcard-activada.v1.json
+          headers:
+            type: zonacards.giftcards.giftcard-activada.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.giftcard-activada.v1
+            subject: 019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              giftCardId: 019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52
+
+    GiftCardAnulada:
+      name: zonacards.giftcards.giftcard-anulada.v1
+      title: Gift card anulada
+      summary: Se anuló una gift card individual por la API.
+      description: |
+        No se emite para las gift cards anuladas en bloque al anular su lote. `subject` es el
+        `giftCardId`. Hoy ninguna cola de este repositorio está suscrita a este tipo.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.giftcard-anulada.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/GiftCardAnulada'
+      examples:
+        - name: zonacards.giftcards.giftcard-anulada.v1
+          summary: Copia de docs/eventos/ejemplos/zonacards.giftcards.giftcard-anulada.v1.json
+          headers:
+            type: zonacards.giftcards.giftcard-anulada.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b10-7c3a-9f41-0d6b2a5e1c77
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.giftcard-anulada.v1
+            subject: 019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              giftCardId: 019a9c31-2a4e-7f10-a3c2-5b7d9e1f3a52
+              motivo: Reportada como extraviada
+
+    # --- INTERNO: comando de giftcards a sí mismo. No es parte del contrato público. ------------
+    GenerarFragmento:
+      name: zonacards.giftcards.generar-fragmento.v1
+      title: INTERNO - generar fragmento
+      summary: Comando interno de giftcards que ordena generar las gift cards de un fragmento.
+      description: |
+        **Mensaje interno del dominio giftcards.** Un comando no es un evento: es una
+        instrucción que el dominio envía a sus propios trabajadores, directo a su cola de
+        trabajo. No se publica en el topic ni forma parte del contrato público, así que puede
+        cambiar con el código. Usa el mismo sobre que los eventos; `subject` es el `loteId`.
+      tags:
+        - $ref: '#/components/tags/giftcards'
+        - $ref: '#/components/tags/interno'
+      traits:
+        - $ref: '#/components/messageTraits/CloudEvent'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type:
+                const: zonacards.giftcards.generar-fragmento.v1
+              source:
+                const: /zonacards/giftcards
+              data:
+                $ref: '#/components/schemas/GenerarFragmento'
+      examples:
+        - name: zonacards.giftcards.generar-fragmento.v1
+          summary: >-
+            Ejemplo ilustrativo. No tiene archivo en docs/eventos/ejemplos porque el comando no
+            forma parte del contrato público.
+          headers:
+            type: zonacards.giftcards.generar-fragmento.v1
+            tenantid: pe
+          payload:
+            specversion: '1.0'
+            id: 019a9c2e-7b3c-7a52-b1c4-6e0d2f4a8c13
+            source: /zonacards/giftcards
+            type: zonacards.giftcards.generar-fragmento.v1
+            subject: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+            time: '2026-11-18T15:04:05.123Z'
+            datacontenttype: application/json
+            tenantid: pe
+            correlationid: 6f1c2d0e-3b7a-4c55-9e0f-2a4b6c8d0e11
+            traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+            data:
+              loteId: 019a9c2e-6f04-7d21-8b5e-3c1a9e7f2b10
+              fragmento: 3
+              totalFragmentos: 5
+              desdeSecuencia: 2001
+              cantidad: 1000
+
+  schemas:
+    # --- Sobre ---------------------------------------------------------------------------------
+    EventEnvelope:
+      title: Sobre CloudEvents 1.0
+      type: object
+      description: |
+        Sobre de todos los mensajes: CloudEvents 1.0 en modo estructurado JSON, más tres
+        atributos de extensión (`tenantid`, `correlationid`, `traceparent`). Los nombres van en
+        minúsculas porque así lo pide la especificación. Los atributos sin valor se omiten; no
+        se escriben como `null`.
+
+        El lector es tolerante: ignora los atributos que no conoce. Solo rechaza un documento
+        que no es JSON o al que le faltan `id` o `type`.
+      required:
+        - specversion
+        - id
+        - source
+        - type
+        - subject
+        - time
+        - datacontenttype
+        - tenantid
+        - correlationid
+        - data
+      properties:
+        specversion:
+          type: string
+          const: '1.0'
+          description: Versión de CloudEvents. Siempre `1.0`.
+        id:
+          type: string
+          format: uuid
+          description: >-
+            Identificador único del evento (UUID versión 7). Los consumidores deduplican por
+            él: una reentrega trae el mismo `id`.
+        source:
+          type: string
+          format: uri-reference
+          enum:
+            - /zonacards/lotes
+            - /zonacards/giftcards
+          description: Servicio que produjo el evento, como referencia URI.
+        type:
+          type: string
+          pattern: '^zonacards\.[a-z]+\.[a-z]+(-[a-z]+)*\.v[1-9][0-9]*$'
+          description: >-
+            Tipo del evento, `zonacards.<dominio>.<hecho>.v<mayor>`. Viaja también como atributo
+            de mensaje `type` para que el broker filtre sin leer el cuerpo.
+        subject:
+          type: string
+          format: uuid
+          description: >-
+            Identificador del agregado del que habla el evento: el `loteId` o el `giftCardId`.
+        time:
+          type: string
+          format: date-time
+          description: >-
+            Instante UTC en que el productor creó el evento, en ISO-8601 (por ejemplo
+            `2026-11-18T15:04:05.123Z`). No es el instante de publicación ni el de entrega.
+        datacontenttype:
+          type: string
+          const: application/json
+          description: Formato de `data`. Siempre `application/json`.
+        tenantid:
+          type: string
+          minLength: 1
+          description: >-
+            Extensión. Tenant dueño del agregado. Un handler solo puede tocar filas de ese
+            tenant. Viaja también como atributo de mensaje `tenantid`.
+        correlationid:
+          type: string
+          minLength: 1
+          description: >-
+            Extensión. Une todo lo causado por una misma petición: se fija al entrar una petición
+            HTTP (cabecera `X-Request-ID` o un UUID nuevo) o al consumir un mensaje (el del
+            mensaje consumido), y se copia en cada evento producido mientras se atiende.
+        traceparent:
+          type: string
+          pattern: '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+          description: >-
+            Extensión, opcional. Contexto de traza W3C del productor. Se omite cuando no hay un
+            span activo. El consumidor abre su span como hijo de este.
+        data:
+          type: object
+          description: >-
+            Carga del evento. Su esquema pertenece al productor y se versiona con `type`.
+
+    MessageAttributes:
+      title: Atributos de mensaje de SNS/SQS
+      type: object
+      description: |
+        Atributos de mensaje (`MessageAttributes`, `DataType: String`) que acompañan al cuerpo
+        tanto al publicar en SNS como al enviar directo a SQS. No son parte del sobre: repiten
+        dos de sus atributos para que el broker pueda enrutar sin leer el cuerpo. Con la entrega
+        sin envoltura, SNS los copia como atributos del mensaje SQS.
+      required:
+        - type
+        - tenantid
+      properties:
+        type:
+          type: string
+          description: >-
+            Mismo valor que el atributo `type` del sobre. Es el atributo sobre el que filtran las
+            suscripciones SNS. El consumidor despacha por el `type` del cuerpo y usa este
+            atributo solo en métricas y logs.
+        tenantid:
+          type: string
+          description: >-
+            Mismo valor que el atributo `tenantid` del sobre. Hoy ningún filtro lo usa.
+
+    # --- Tipos compartidos -----------------------------------------------------------------------
+    LoteId:
+      type: string
+      format: uuid
+      description: Identificador del lote (UUID versión 7).
+    GiftCardId:
+      type: string
+      format: uuid
+      description: Identificador de la gift card (UUID versión 7).
+    Pais:
+      type: string
+      pattern: '^[0-9]{3}$'
+      description: >-
+        País en ISO 3166-1 numérico, tres dígitos (por ejemplo `604`). Es el prefijo del código
+        de cada gift card.
+    Moneda:
+      type: string
+      pattern: '^[A-Z]{3}$'
+      description: Moneda en ISO 4217, tres letras mayúsculas (por ejemplo `PEN`).
+    Monto:
+      type: number
+      exclusiveMinimum: 0
+      description: >-
+        Importe de cada gift card. Número JSON escrito con exactamente dos decimales y sin
+        notación exponencial (`50.00`, nunca `5E+1`, `50.0` ni una cadena). Debe leerse como
+        decimal exacto, no como coma flotante binaria. El productor valida hoy que sea mayor que
+        cero y como máximo `9999999.99`.
+    VigenciaHasta:
+      type: string
+      format: date
+      description: >-
+        Último día de vigencia de la gift card. Fecha ISO-8601 sin hora (`AAAA-MM-DD`).
+
+    # --- data de los eventos de lotes ------------------------------------------------------------
+    LoteSolicitado:
+      title: data de zonacards.lotes.lote-solicitado.v1
+      type: object
+      description: Record `LoteEvents.LoteSolicitado`.
+      required:
+        - loteId
+        - pais
+        - moneda
+        - monto
+        - cantidad
+        - vigenciaHasta
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        pais:
+          $ref: '#/components/schemas/Pais'
+        moneda:
+          $ref: '#/components/schemas/Moneda'
+        monto:
+          $ref: '#/components/schemas/Monto'
+        cantidad:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >-
+            Número de gift cards a generar. El productor valida hoy entre 1 y 200000.
+        vigenciaHasta:
+          $ref: '#/components/schemas/VigenciaHasta'
+
+    LoteAnulado:
+      title: data de zonacards.lotes.lote-anulado.v1
+      type: object
+      description: Record `LoteEvents.LoteAnulado`.
+      required:
+        - loteId
+        - motivo
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        motivo:
+          type: string
+          description: >-
+            Motivo indicado al anular, o `Anulado por el usuario` si no se indicó ninguno. El
+            productor valida hoy un máximo de 300 caracteres.
+
+    LoteGenerado:
+      title: data de zonacards.lotes.lote-generado.v1
+      type: object
+      description: Record `LoteEvents.LoteGenerado`.
+      required:
+        - loteId
+        - cantidad
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        cantidad:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >-
+            Gift cards generadas: la suma de las cantidades de todos los fragmentos registrados.
+
+    LoteFallido:
+      title: data de zonacards.lotes.lote-fallido.v1
+      type: object
+      description: Record `LoteEvents.LoteFallido`.
+      required:
+        - loteId
+        - motivo
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        motivo:
+          type: string
+          description: >-
+            Texto `Fragmento <n>: <motivo>`, armado con el número y el motivo del
+            `fragmento-fallido` que hizo fallar el lote.
+
+    # --- data de los eventos de giftcards --------------------------------------------------------
+    GeneracionIniciada:
+      title: data de zonacards.giftcards.generacion-iniciada.v1
+      type: object
+      description: Record `GiftcardsEvents.GeneracionIniciada`.
+      required:
+        - loteId
+        - totalFragmentos
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        totalFragmentos:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >-
+            Número de fragmentos en que se dividió el lote: la cantidad solicitada entre el
+            tamaño de fragmento, redondeando hacia arriba (1000 gift cards por fragmento por
+            defecto).
+
+    FragmentoGenerado:
+      title: data de zonacards.giftcards.fragmento-generado.v1
+      type: object
+      description: Record `GiftcardsEvents.FragmentoGenerado`.
+      required:
+        - loteId
+        - fragmento
+        - totalFragmentos
+        - cantidad
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        fragmento:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Número del fragmento dentro del lote, de 1 a `totalFragmentos`.
+        totalFragmentos:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >-
+            Total de fragmentos del lote. Se repite en cada evento para que el consumidor pueda
+            cerrar el lote aunque no haya recibido `generacion-iniciada`.
+        cantidad:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Gift cards generadas en este fragmento.
+
+    FragmentoFallido:
+      title: data de zonacards.giftcards.fragmento-fallido.v1
+      type: object
+      description: Record `GiftcardsEvents.FragmentoFallido`.
+      required:
+        - loteId
+        - fragmento
+        - motivo
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        fragmento:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Número del fragmento que no pudo generarse.
+        motivo:
+          type: string
+          description: Causa del fallo, como texto para personas.
+
+    LoteAnuladoAplicado:
+      title: data de zonacards.giftcards.lote-anulado-aplicado.v1
+      type: object
+      description: Record `GiftcardsEvents.LoteAnuladoAplicado`.
+      required:
+        - loteId
+        - giftcardsAnuladas
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        giftcardsAnuladas:
+          type: integer
+          format: int32
+          minimum: 0
+          description: >-
+            Gift cards del lote que pasaron a `ANULADA` con esta anulación; las que ya estaban
+            anuladas no cuentan. Es 0 cuando la anulación llegó antes de que se generara nada.
+
+    GiftCardEmitida:
+      title: data de zonacards.giftcards.giftcard-emitida.v1
+      type: object
+      description: Record `GiftcardsEvents.GiftCardEmitida`.
+      required:
+        - giftCardId
+        - pais
+        - moneda
+        - monto
+        - vigenciaHasta
+      properties:
+        giftCardId:
+          $ref: '#/components/schemas/GiftCardId'
+        pais:
+          $ref: '#/components/schemas/Pais'
+        moneda:
+          $ref: '#/components/schemas/Moneda'
+        monto:
+          $ref: '#/components/schemas/Monto'
+        vigenciaHasta:
+          $ref: '#/components/schemas/VigenciaHasta'
+
+    GiftCardActivada:
+      title: data de zonacards.giftcards.giftcard-activada.v1
+      type: object
+      description: Record `GiftcardsEvents.GiftCardActivada`.
+      required:
+        - giftCardId
+      properties:
+        giftCardId:
+          $ref: '#/components/schemas/GiftCardId'
+
+    GiftCardAnulada:
+      title: data de zonacards.giftcards.giftcard-anulada.v1
+      type: object
+      description: Record `GiftcardsEvents.GiftCardAnulada`.
+      required:
+        - giftCardId
+        - motivo
+      properties:
+        giftCardId:
+          $ref: '#/components/schemas/GiftCardId'
+        motivo:
+          type: string
+          description: >-
+            Motivo indicado al anular, o `Anulada por el usuario` si no se indicó ninguno. El
+            productor valida hoy un máximo de 300 caracteres.
+
+    # --- INTERNO: data del comando de giftcards --------------------------------------------------
+    GenerarFragmento:
+      title: INTERNO - data de zonacards.giftcards.generar-fragmento.v1
+      type: object
+      description: >-
+        Record `GeneracionCommands.GenerarFragmento`. Interno del dominio giftcards; no es parte
+        del contrato público.
+      required:
+        - loteId
+        - fragmento
+        - totalFragmentos
+        - desdeSecuencia
+        - cantidad
+      properties:
+        loteId:
+          $ref: '#/components/schemas/LoteId'
+        fragmento:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Número del fragmento dentro del lote, de 1 a `totalFragmentos`.
+        totalFragmentos:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Total de fragmentos del lote.
+        desdeSecuencia:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >-
+            Primera posición del fragmento dentro del lote. El fragmento cubre las secuencias
+            `desdeSecuencia` a `desdeSecuencia + cantidad - 1`.
+        cantidad:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Gift cards que debe generar este fragmento.
