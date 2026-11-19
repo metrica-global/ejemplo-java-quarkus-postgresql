@@ -1,0 +1,518 @@
+# Builds the image of each affected service and publishes it to Amazon ECR.
+#
+#   affected services -> build (amd64 + arm64) and push by digest -> scan
+#     -> SBOM -> signature -> attestations -> tag with the commit SHA
+#
+# The tag is the last step on purpose. ECR tags are immutable, so an image only
+# receives its tag once it has passed the scan and has been signed: a tag that
+# exists is an image that may be deployed. A build that fails before that
+# leaves an untagged image, which the lifecycle policy of the repository
+# removes, and the commit can be built again.
+#
+# AWS access is short-lived: GitHub OIDC and the build role. No access key is
+# stored in the repository.
+name: build-push
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      services:
+        description: Services to build from the selected commit of main
+        type: choice
+        options: [all, lotes, giftcards]
+        default: all
+
+permissions:
+  contents: read
+
+# One run per commit. Runs of different commits do not wait for each other.
+concurrency:
+  group: build-push-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The commit that passed CI. In a workflow_run event github.sha is the tip of
+  # the default branch, which may already be a later commit.
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  # Platform of the Fargate tasks (cpu_architecture = "ARM64" in Terraform).
+  # The SBOM describes this variant of the image.
+  RUNTIME_PLATFORM: linux/arm64
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Which services to build.
+  #
+  # A service is affected when the files that end up in its image changed since
+  # the last image published for it. That image is looked up in ECR instead of
+  # comparing with the previous commit: a commit whose CI or build failed never
+  # produced an image, so its changes are picked up by the next successful run.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: affected services
+    # Only commits pushed to main of this repository. The build role trusts
+    # nothing else, and the filter `branches` above matches the branch NAME,
+    # which a fork may also call main.
+    #
+    # Without the build role there is no registry to publish to: the whole
+    # workflow is skipped until the repository variables are set, instead of
+    # failing after every push to main.
+    if: >-
+      vars.AWS_BUILD_ROLE_ARN != '' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # assume the build role (reads the image tags in ECR)
+    outputs:
+      build: ${{ steps.affected.outputs.build }}
+      release: ${{ steps.affected.outputs.release }}
+      published: ${{ steps.affected.outputs.published }}
+    steps:
+      - name: Refuse a manual run outside main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run this workflow from main. The build role only trusts refs/heads/main."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0 # the comparison needs the history
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: build-changes-${{ github.run_id }}
+
+      - name: Compare with the last published images
+        id: affected
+        env:
+          REQUESTED: ${{ inputs.services || 'affected' }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit # a failed AWS call inside $(...) stops the step
+
+          # Files that end up in every image. A change in any of them affects
+          # both services; a change under services/<name>-service only that one.
+          common=(pom.xml mvnw .mvn Dockerfile .dockerignore libs)
+
+          # Digest of repository:tag, or nothing when the tag does not exist.
+          image_digest() {
+            local out
+            if out="$(aws ecr describe-images --repository-name "$1" --image-ids "imageTag=$2" \
+              --query 'imageDetails[0].imageDigest' --output text 2>&1)"; then
+              printf '%s\n' "$out"
+            elif grep -q ImageNotFoundException <<<"$out"; then
+              return 0
+            else
+              printf '%s\n' "$out" >&2
+              return 1
+            fi
+          }
+
+          # Tag of the newest image of the repository that was built from an
+          # earlier commit of this history, or nothing.
+          last_built() {
+            local tags tag
+            tags="$(aws ecr describe-images --repository-name "$1" --filter tagStatus=TAGGED --output json |
+              jq -r '.imageDetails | sort_by(.imagePushedAt) | reverse | .[].imageTags[]
+                     | select(test("^[0-9a-f]{40}$"))')"
+            for tag in $tags; do
+              if [ "$tag" != "$SHA" ] && git merge-base --is-ancestor "$tag" "$SHA" 2>/dev/null; then
+                printf '%s\n' "$tag"
+                return 0
+              fi
+            done
+          }
+
+          build=()
+          release=()
+          published='{}'
+          {
+            echo "### Affected services"
+            echo
+            echo "Commit \`${SHA}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for service in lotes giftcards; do
+            repository="zonacards/${service}-service"
+            digest="$(image_digest "$repository" "$SHA")"
+
+            if [ "$REQUESTED" != "affected" ] && [ "$REQUESTED" != "all" ] && [ "$REQUESTED" != "$service" ]; then
+              verdict="not requested"
+            elif [ -n "$digest" ]; then
+              # Tags are immutable: the image of this commit is reused as it is.
+              verdict="already published (\`${digest}\`)"
+              release+=("$service")
+              published="$(jq -c --arg s "$service" --arg d "$digest" '.[$s] = $d' <<<"$published")"
+            elif [ "$REQUESTED" != "affected" ]; then
+              verdict="build (requested manually)"
+              build+=("$service")
+              release+=("$service")
+            else
+              base="$(last_built "$repository")"
+              if [ -z "$base" ]; then
+                verdict="build (no image of an earlier commit)"
+              elif ! git diff --quiet "$base" "$SHA" -- "${common[@]}" "services/${service}-service"; then
+                verdict="build (changes since \`${base}\`)"
+              else
+                verdict="skip (no changes since \`${base}\`)"
+              fi
+              if [[ "$verdict" == build* ]]; then
+                build+=("$service")
+                release+=("$service")
+              fi
+            fi
+
+            echo "- **${service}**: ${verdict}" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          {
+            echo "build=$(jq -cn '$ARGS.positional' --args "${build[@]}")"
+            echo "release=$(jq -cn '$ARGS.positional' --args "${release[@]}")"
+            echo "published=${published}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # One image per service, for linux/amd64 and linux/arm64.
+  # ---------------------------------------------------------------------------
+  image:
+    name: image (${{ matrix.service }})
+    needs: changes
+    if: needs.changes.outputs.build != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write # build role, keyless signature and attestations
+      attestations: write # store the attestations in GitHub
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.build) }}
+    # A matrix job merges the outputs of its instances. Each instance writes
+    # only the output named after its own service.
+    outputs:
+      digest_lotes: ${{ steps.result.outputs.digest_lotes }}
+      digest_giftcards: ${{ steps.result.outputs.digest_giftcards }}
+    env:
+      SERVICE: ${{ matrix.service }}
+      # Repository names are part of the contract with Terraform (modules/platform).
+      REPOSITORY: zonacards/${{ matrix.service }}-service
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: build-${{ matrix.service }}-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+        id: ecr
+
+      # The build stage of the Dockerfile runs on the platform of the runner
+      # and compiles once. QEMU is only needed for the few commands of the
+      # runtime stage that run on arm64.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          build-args: |
+            SERVICE=${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          # No tag yet: see the comment at the top of this file.
+          outputs: type=image,name=${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=zonacards-${{ matrix.service }}-service
+            org.opencontainers.image.revision=${{ env.SHA }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # Provenance and SBOM are produced below as signed attestations, not
+          # as unsigned manifests inside the image index.
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Image reference
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "name=${REGISTRY}/${REPOSITORY}"
+            echo "ref=${REGISTRY}/${REPOSITORY}@${DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The gate. Both published platforms are scanned straight from the
+      # registry. A HIGH or CRITICAL vulnerability that has a fix fails the job
+      # and the image never receives its tag.
+      - name: Vulnerability scan (linux/arm64)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: remote
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          hide-progress: true
+
+      - name: Vulnerability scan (linux/amd64)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_IMAGE_SRC: remote
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          hide-progress: true
+
+      - name: SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        env:
+          SYFT_PLATFORM: ${{ env.RUNTIME_PLATFORM }}
+        with:
+          image: ${{ steps.image.outputs.ref }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.service }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.spdx.json
+          if-no-files-found: error
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Keyless: the certificate is issued to the identity of this workflow
+      # run (GitHub OIDC). There is no signing key to store or rotate.
+      - name: Sign the image
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: cosign sign --yes "$IMAGE"
+
+      # Artifact attestations need a public repository or GitHub Enterprise
+      # Cloud. Set ARTIFACT_ATTESTATIONS_ENABLED to `false` elsewhere.
+      - name: Attest the build provenance
+        if: vars.ARTIFACT_ATTESTATIONS_ENABLED != 'false'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the SBOM
+        if: vars.ARTIFACT_ATTESTATIONS_ENABLED != 'false'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom-${{ matrix.service }}.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Tag with the commit SHA
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          # Points the tag at the manifest that was scanned and signed. Nothing
+          # is rebuilt or pulled, and the digest does not change.
+          docker buildx imagetools create --tag "${IMAGE}:${SHA}" "${IMAGE}@${DIGEST}"
+          tagged="$(docker buildx imagetools inspect "${IMAGE}:${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ "$tagged" != "$DIGEST" ]; then
+            echo "::error::${IMAGE}:${SHA} points at ${tagged}, expected ${DIGEST}"
+            exit 1
+          fi
+
+      - name: Result
+        id: result
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          echo "digest_${SERVICE}=${DIGEST}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${SERVICE}"
+            echo
+            echo "- Image: \`${IMAGE}:${SHA}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Signed by: \`${GITHUB_SERVER_URL}/${WORKFLOW_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Optional: the same image, by digest, in the registry of a second AWS
+  # account.
+  #
+  # ECR repositories exist once per account. When production runs in its own
+  # account, its task definitions pull from the registry of that account, so
+  # the image must be there before it can be promoted. The copy is done from
+  # registry to registry and keeps the digest. Enabled by the repository
+  # variable AWS_BUILD_ROLE_ARN_PROD (the build role of that account).
+  # ---------------------------------------------------------------------------
+  replicate:
+    name: copy to the production registry (${{ matrix.service }})
+    needs: [changes, image]
+    if: >-
+      !cancelled() && vars.AWS_BUILD_ROLE_ARN_PROD != '' &&
+      needs.changes.result == 'success' && needs.changes.outputs.release != '[]' &&
+      (needs.image.result == 'success' || needs.image.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      id-token: write # both build roles and the keyless signature
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.release) }}
+    env:
+      REPOSITORY: zonacards/${{ matrix.service }}-service
+    steps:
+      - name: Assume the build role (source registry)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: replicate-source-${{ github.run_id }}
+
+      - uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+        id: source
+
+      # From here on the AWS CLI talks to the production account. Docker keeps
+      # the login to both registries.
+      - name: Assume the build role (production registry)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN_PROD }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: replicate-target-${{ github.run_id }}
+          unset-current-credentials: true
+
+      - uses: aws-actions/amazon-ecr-login@7290e214a610b32bc0eef81748948b6d466a8783 # v2.2.0
+        id: target
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Copy the image
+        id: copy
+        env:
+          SOURCE: ${{ steps.source.outputs.registry }}/${{ env.REPOSITORY }}
+          TARGET: ${{ steps.target.outputs.registry }}/${{ env.REPOSITORY }}
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${SOURCE}:${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+
+          # What the production registry already has under this tag, if anything.
+          if existing="$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=${SHA}" \
+            --query 'imageDetails[0].imageDigest' --output text 2>&1)"; then
+            if [ "$existing" != "$digest" ]; then
+              echo "::error::${TARGET}:${SHA} already exists with digest ${existing}, expected ${digest}"
+              exit 1
+            fi
+            echo "Already copied: ${TARGET}:${SHA} (${digest})"
+          elif grep -q ImageNotFoundException <<<"$existing"; then
+            docker buildx imagetools create --tag "${TARGET}:${SHA}" "${SOURCE}@${digest}"
+            copied="$(docker buildx imagetools inspect "${TARGET}:${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+            if [ "$copied" != "$digest" ]; then
+              echo "::error::${TARGET}:${SHA} has digest ${copied}, expected ${digest}"
+              exit 1
+            fi
+          else
+            printf '%s\n' "$existing" >&2
+            exit 1
+          fi
+          echo "ref=${TARGET}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # A signature lives next to the image it signs, so the copy gets its own.
+      # The attestations are stored in GitHub by digest and apply to both.
+      - name: Sign the copy
+        env:
+          IMAGE: ${{ steps.copy.outputs.ref }}
+        run: cosign sign --yes "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # What this run released: the input of the deploy workflow.
+  # ---------------------------------------------------------------------------
+  release:
+    name: release manifest
+    needs: [changes, image, replicate]
+    if: >-
+      !cancelled() && needs.changes.result == 'success' &&
+      (needs.image.result == 'success' || needs.image.result == 'skipped') &&
+      (needs.replicate.result == 'success' || needs.replicate.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Write the manifest
+        env:
+          RELEASE: ${{ needs.changes.outputs.release }}
+          PUBLISHED: ${{ needs.changes.outputs.published }}
+          DIGEST_LOTES: ${{ needs.image.outputs.digest_lotes }}
+          DIGEST_GIFTCARDS: ${{ needs.image.outputs.digest_giftcards }}
+        run: |
+          set -euo pipefail
+          # Digests of the images built by this run, over the ones that were
+          # already published for this commit.
+          jq -n \
+            --arg tag "$SHA" \
+            --argjson release "$RELEASE" \
+            --argjson published "$PUBLISHED" \
+            --arg lotes "$DIGEST_LOTES" \
+            --arg giftcards "$DIGEST_GIFTCARDS" '
+              ($published + ({lotes: $lotes, giftcards: $giftcards} | with_entries(select(.value != "")))) as $digests
+              | {tag: $tag, services: [$release[] | {name: ., digest: ($digests[.] // "")}]}
+            ' > release.json
+          cat release.json
+
+          if ! jq -e 'all(.services[]; .digest | test("^sha256:[0-9a-f]{64}$"))' release.json > /dev/null; then
+            echo "::error::A released service has no image digest."
+            exit 1
+          fi
+
+      # Uploaded even when no service was affected: an empty list tells the
+      # deploy workflow that there is nothing to do.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-manifest
+          path: release.json
+          if-no-files-found: error

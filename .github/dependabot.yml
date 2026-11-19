@@ -1,0 +1,89 @@
+# Dependency updates, weekly, grouped so that related versions arrive in one
+# pull request instead of one per artifact.
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # Maven: the parent POM and every module it lists.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    # Most versions come from the Quarkus BOM. The parent POM pins only the
+    # platform, the build plugins, ArchUnit and Bouncy Castle; the last two are
+    # left ungrouped so each gets its own pull request.
+    groups:
+      # The two platform BOMs and the Quarkus plugin share one version property.
+      quarkus:
+        patterns:
+          - "io.quarkus*"
+      maven-plugins:
+        patterns:
+          - "org.apache.maven.plugins:*"
+          - "org.jacoco:*"
+          - "io.smallrye:jandex-maven-plugin"
+    ignore:
+      # Quarkus is pinned to its LTS stream in the parent POM. Patch releases
+      # of that stream are proposed; moving to another stream is a decision.
+      - dependency-name: "io.quarkus*"
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions: the pinned commit SHAs and their version comments.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # ---------------------------------------------------------------------------
+  # Docker: the base images of the Dockerfile at the root.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: docker
+    groups:
+      base-images:
+        patterns:
+          - "*"
+
+  # ---------------------------------------------------------------------------
+  # Terraform: providers and modules of every root and module, with their lock
+  # files. One group, so the three environments, which must stay identical,
+  # change in the same pull request.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: terraform
+    directories:
+      - /infra/terraform/bootstrap
+      - /infra/terraform/local
+      - /infra/terraform/tests
+      - /infra/terraform/envs/*
+      - /infra/terraform/modules/*
+      - /infra/terraform/modules/messaging/topology
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: infra
+    groups:
+      terraform:
+        patterns:
+          - "*"

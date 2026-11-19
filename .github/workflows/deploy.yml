@@ -1,0 +1,187 @@
+# Deploys images that already exist in ECR. Nothing is built here: the tag that
+# reached dev is the tag that is promoted to qa and to prod, and each
+# environment checks that it resolves to the same digest.
+#
+#   after a successful build-push on main:  dev -> qa -> prod
+#   manual run (the rollback path):         one environment, one image tag
+#
+# dev deploys on its own. qa and prod wait for the reviewers of their GitHub
+# environment. The steps of one environment are in deploy-environment.yml.
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [build-push]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy to
+        type: choice
+        options: [dev, qa, prod]
+        required: true
+      service:
+        description: Service to deploy
+        type: choice
+        options: [all, lotes, giftcards]
+        default: all
+      image_tag:
+        description: Image tag that already exists in ECR (the commit SHA of a previous build)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # What to deploy: the services and the tag released by the build that just
+  # finished, or the ones given by hand.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: what to deploy
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # download the release manifest of the build run
+    outputs:
+      tag: ${{ steps.manifest.outputs.tag || steps.manual.outputs.tag }}
+      services: ${{ steps.manifest.outputs.services || steps.manual.outputs.services }}
+      digests: ${{ steps.manifest.outputs.digests || steps.manual.outputs.digests }}
+    steps:
+      - name: Refuse a manual run outside main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run this workflow from main."
+          exit 1
+
+      - name: From the release manifest of the build
+        id: manifest
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/release"
+
+          count="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name == "release-manifest")] | length')"
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::The build run ${BUILD_RUN_ID} released nothing."
+            { echo "tag="; echo "services=[]"; echo "digests={}"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name release-manifest --dir "$dir"
+
+          # The manifest comes from another workflow run: check its shape
+          # before any value is used.
+          if ! jq -e '
+            (.tag | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.services | type == "array") and
+            all(.services[];
+              (.name == "lotes" or .name == "giftcards") and
+              (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))
+          ' "${dir}/release.json" > /dev/null; then
+            echo "::error::release.json of run ${BUILD_RUN_ID} is not a valid release manifest."
+            exit 1
+          fi
+
+          {
+            echo "tag=$(jq -r .tag "${dir}/release.json")"
+            echo "services=$(jq -c '[.services[].name]' "${dir}/release.json")"
+            echo "digests=$(jq -c '[.services[] | {(.name): .digest}] | add // {}' "${dir}/release.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: From the manual inputs
+        id: manual
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_SERVICE: ${{ inputs.service }}
+          INPUT_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$INPUT_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "::error::image_tag is not a valid image tag."
+            exit 1
+          fi
+          case "$INPUT_SERVICE" in
+            all) services='["lotes","giftcards"]' ;;
+            lotes | giftcards) services="[\"${INPUT_SERVICE}\"]" ;;
+            *)
+              echo "::error::Unknown service."
+              exit 1
+              ;;
+          esac
+          {
+            echo "tag=${INPUT_TAG}"
+            echo "services=${services}"
+            # No digest to compare with: the tag is resolved in each registry.
+            echo "digests={}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # dev: no approval.
+  # ---------------------------------------------------------------------------
+  dev:
+    needs: plan
+    if: >-
+      needs.plan.outputs.services != '[]' &&
+      (github.event_name == 'workflow_run' || inputs.environment == 'dev')
+    permissions:
+      contents: read
+      id-token: write # the deploy role of the environment
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: dev
+      tag: ${{ needs.plan.outputs.tag }}
+      services: ${{ needs.plan.outputs.services }}
+      digests: ${{ needs.plan.outputs.digests }}
+
+  # ---------------------------------------------------------------------------
+  # qa: after dev, when its reviewers approve.
+  # ---------------------------------------------------------------------------
+  qa:
+    needs: [plan, dev]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.services != '[]' &&
+      ((github.event_name == 'workflow_run' && needs.dev.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.environment == 'qa'))
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: qa
+      tag: ${{ needs.plan.outputs.tag }}
+      services: ${{ needs.plan.outputs.services }}
+      digests: ${{ needs.plan.outputs.digests }}
+
+  # ---------------------------------------------------------------------------
+  # prod: after qa, when its reviewers approve.
+  # ---------------------------------------------------------------------------
+  prod:
+    needs: [plan, qa]
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.services != '[]' &&
+      ((github.event_name == 'workflow_run' && needs.qa.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.environment == 'prod'))
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/deploy-environment.yml
+    with:
+      environment: prod
+      tag: ${{ needs.plan.outputs.tag }}
+      services: ${{ needs.plan.outputs.services }}
+      digests: ${{ needs.plan.outputs.digests }}

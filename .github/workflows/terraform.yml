@@ -1,0 +1,317 @@
+# Checks of the infrastructure code. This workflow never changes anything in
+# AWS: it formats, validates, lints, scans, tests against mocked providers and,
+# on pull requests, shows a read-only plan per environment. Applying is done by
+# a person, outside GitHub Actions.
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - infra/terraform/**
+      # Embedded by Terraform in the database bootstrap task definition.
+      - deploy/db/bootstrap-service.sql
+      - .github/workflows/terraform.yml
+  push:
+    branches: [main]
+    paths:
+      - infra/terraform/**
+      - deploy/db/bootstrap-service.sql
+      - .github/workflows/terraform.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TF_VERSION: "1.16.2" # the configurations require >= 1.16
+  TFLINT_VERSION: v0.66.0
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive -diff
+
+  # ---------------------------------------------------------------------------
+  # Syntax and types of every root. No backend and no credentials.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: validate (${{ matrix.root }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        root: [bootstrap, local, envs/dev, envs/qa, envs/prod]
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra/terraform/${{ matrix.root }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # readonly: the providers must be the ones recorded in the lock file.
+      - name: terraform init
+        run: terraform init -backend=false -input=false -lockfile=readonly -no-color
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Install the tflint plugins
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids the anonymous rate limit of the GitHub API
+        run: tflint --init --config "${GITHUB_WORKSPACE}/infra/terraform/.tflint.hcl"
+
+      - name: tflint
+        working-directory: infra/terraform
+        run: tflint --recursive --config "${GITHUB_WORKSPACE}/infra/terraform/.tflint.hcl"
+
+  # ---------------------------------------------------------------------------
+  # Misconfigurations. Each environment is scanned with its own tfvars (see
+  # infra/terraform/README.md). The same scan runs in security.yml for every
+  # change of the repository; here it gates the infrastructure changes.
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: IaC scan (${{ matrix.root }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - root: bootstrap
+            tfvars: ""
+          - root: envs/dev
+            tfvars: infra/terraform/envs/dev/terraform.tfvars
+          - root: envs/qa
+            tfvars: infra/terraform/envs/qa/terraform.tfvars
+          - root: envs/prod
+            tfvars: infra/terraform/envs/prod/terraform.tfvars
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/terraform/${{ matrix.root }}
+          tf-vars: ${{ matrix.tfvars }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          hide-progress: true
+
+  # ---------------------------------------------------------------------------
+  # Native tests (*.tftest.hcl): they plan the real configuration against
+  # mocked providers. No credentials and no API calls.
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.dir }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [tests, envs/dev, envs/qa, envs/prod]
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra/terraform/${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -backend=false -input=false -lockfile=readonly -no-color
+
+      - name: terraform test
+        run: terraform test -no-color
+
+  # ---------------------------------------------------------------------------
+  # Plan per environment, on pull requests of this repository only.
+  #
+  # The plan role is read-only and trusts the `pull_request` subject of the
+  # OIDC token. A job that declares a GitHub environment gets a different
+  # subject, so this job must not declare one; that is why the role and the
+  # state bucket of each environment are repository variables. A pull request
+  # from a fork receives no OIDC token and is skipped.
+  #
+  # An environment without its variables is skipped, not failed: the roles
+  # exist only after the infrastructure has been applied for the first time.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan (${{ matrix.environment }})
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs: [fmt, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # assume the read-only plan role
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: dev
+            role_variable: AWS_PLAN_ROLE_ARN_DEV
+            bucket_variable: TF_STATE_BUCKET_DEV
+          - environment: qa
+            role_variable: AWS_PLAN_ROLE_ARN_QA
+            bucket_variable: TF_STATE_BUCKET_QA
+          - environment: prod
+            role_variable: AWS_PLAN_ROLE_ARN_PROD
+            bucket_variable: TF_STATE_BUCKET_PROD
+    env:
+      ENVIRONMENT: ${{ matrix.environment }}
+      PLAN_ROLE_ARN: ${{ vars[matrix.role_variable] }}
+      STATE_BUCKET: ${{ vars[matrix.bucket_variable] }}
+      # The plan role may only take the state lock when the environment was
+      # applied with `state_bucket_arn`. Set TF_PLAN_LOCK to `true` in that case.
+      PLAN_LOCK: ${{ vars.TF_PLAN_LOCK == 'true' }}
+      ROLE_VARIABLE: ${{ matrix.role_variable }}
+      BUCKET_VARIABLE: ${{ matrix.bucket_variable }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra/terraform/envs/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check that the environment is configured
+        id: cfg
+        env:
+          REGION: ${{ vars.AWS_REGION }}
+        run: |
+          if [ -n "$PLAN_ROLE_ARN" ] && [ -n "$STATE_BUCKET" ] && [ -n "$REGION" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            message="Plan of ${ENVIRONMENT} skipped: set the repository variables AWS_REGION, ${ROLE_VARIABLE} and ${BUCKET_VARIABLE}."
+            echo "::notice::${message}"
+            echo "${message}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          role-to-assume: ${{ env.PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: plan-${{ matrix.environment }}-${{ github.run_id }}
+
+      # Same key layout as backend.hcl.example of each environment.
+      - name: terraform init
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          terraform init -input=false -lockfile=readonly -no-color \
+            -backend-config="bucket=${STATE_BUCKET}" \
+            -backend-config="key=zonacards/${ENVIRONMENT}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: terraform plan
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -uo pipefail
+          plan_file="${RUNNER_TEMP}/tfplan"
+          log_file="${RUNNER_TEMP}/plan.log"
+          text_file="${RUNNER_TEMP}/plan.txt"
+
+          # Exit code with -detailed-exitcode: 0 no changes, 1 error, 2 changes.
+          set +e
+          terraform plan -input=false -no-color -lock="${PLAN_LOCK}" -detailed-exitcode -out="$plan_file" > "$log_file" 2>&1
+          code=$?
+          set -e
+          cat "$log_file"
+
+          # What the job summary shows: the plan as Terraform renders it
+          # (sensitive values are masked), or the end of the log on failure.
+          case "$code" in
+            0)
+              result="no changes"
+              terraform show -no-color "$plan_file" > "$text_file"
+              ;;
+            2)
+              result="changes"
+              terraform show -no-color "$plan_file" > "$text_file"
+              ;;
+            *)
+              result="failed"
+              tail -c 200000 "$log_file" > "$text_file"
+              ;;
+          esac
+
+          # Cut below the size limit of a step summary (1 MiB).
+          {
+            echo "### terraform plan: ${ENVIRONMENT} (${result})"
+            echo
+            echo '````text'
+            head -c 900000 "$text_file"
+            echo
+            echo '````'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # The plan file may contain secrets in clear text: it is not kept.
+          rm -f "$plan_file"
+
+          if [ "$result" = "failed" ]; then
+            exit 1
+          fi

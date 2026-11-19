@@ -1,0 +1,351 @@
+# Deploys one image tag to one environment. Called by deploy.yml, once per
+# environment; it is not triggered by any event of its own.
+#
+# Per service, in this order:
+#   1. check that the tag exists in the registry of the environment and
+#      resolves to the expected digest
+#   2. register a new revision of the migration task definition and of the
+#      service task definition, both with the image
+#   3. run the migration task and stop here unless its container exits with 0
+#   4. point the service at the new revision and wait for the rollout
+#
+# Terraform creates the services and ignores their task definition: every
+# revision after the first one is registered here. The names (cluster, service,
+# families, container) are not hard-coded; they come from the Terraform outputs
+# stored as variables of the GitHub environment (see docs/cicd.md).
+name: deploy-environment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (dev, qa or prod). Its deploy role trusts only jobs of this environment.
+        type: string
+        required: true
+      tag:
+        description: Image tag to deploy
+        type: string
+        required: true
+      services:
+        description: JSON array with the services to deploy
+        type: string
+        required: true
+      digests:
+        description: JSON object with the expected digest per service. An empty object skips the comparison.
+        type: string
+        default: "{}"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MIGRATION_TIMEOUT_MINUTES: "30"
+  ROLLOUT_TIMEOUT_MINUTES: "30"
+
+jobs:
+  service:
+    name: ${{ matrix.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Required reviewers and the allowed branches are configured on the
+    # environment in GitHub. The job does not start until they are satisfied.
+    environment: ${{ inputs.environment }}
+    # One deployment at a time per service and environment. A newer run waits
+    # for the one in progress and replaces an older one that is still waiting.
+    concurrency:
+      group: deploy-${{ inputs.environment }}-${{ matrix.service }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write # assume the deploy role of the environment
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(inputs.services) }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      SERVICE: ${{ matrix.service }}
+      TAG: ${{ inputs.tag }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+    steps:
+      - name: Read the configuration of the environment
+        id: cfg
+        env:
+          # Named after the variables they come from, for the messages below.
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          ECS_SERVICES: ${{ vars.ECS_SERVICES }}
+          ECS_PRIVATE_SUBNET_IDS: ${{ vars.ECS_PRIVATE_SUBNET_IDS }}
+          DIGESTS: ${{ inputs.digests }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          missing=0
+          for name in AWS_REGION AWS_DEPLOY_ROLE_ARN ECS_CLUSTER ECS_SERVICES ECS_PRIVATE_SUBNET_IDS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The variable ${name} is not set for the environment ${ENVIRONMENT} (see docs/cicd.md)."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          # ECS_SERVICES is the Terraform output `services`, as JSON.
+          field() {
+            jq -er --arg s "$SERVICE" --arg f "$1" '.[$s][$f] | strings | select(. != "")' <<<"$ECS_SERVICES" || {
+              echo "::error::ECS_SERVICES has no ${1} for the service ${SERVICE}." >&2
+              return 1
+            }
+          }
+          service_name="$(field service_name)"
+          container_name="$(field container_name)"
+          family="$(field task_definition_family)"
+          migrate_family="$(field migrate_task_definition_family)"
+          security_group="$(field security_group_id)"
+          log_group="$(field log_group_name)"
+          repository_url="$(field repository_url)"
+
+          # ECS_PRIVATE_SUBNET_IDS is the Terraform output `private_subnet_ids`.
+          subnets="$(jq -er 'map(strings) | select(length > 0) | join(",")' <<<"$ECS_PRIVATE_SUBNET_IDS")" || {
+            echo "::error::ECS_PRIVATE_SUBNET_IDS must be a JSON array of subnet ids."
+            exit 1
+          }
+
+          {
+            echo "service_name=${service_name}"
+            echo "container_name=${container_name}"
+            echo "family=${family}"
+            echo "migrate_family=${migrate_family}"
+            echo "security_group=${security_group}"
+            echo "log_group=${log_group}"
+            echo "subnets=${subnets}"
+            # <registry>/<repository> -> <repository>
+            echo "repository=${repository_url#*/}"
+            echo "image=${repository_url}:${TAG}"
+            echo "expected_digest=$(jq -r --arg s "$SERVICE" '.[$s] // ""' <<<"$DIGESTS")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: deploy-${{ inputs.environment }}-${{ matrix.service }}-${{ github.run_id }}
+
+      # Promotion never rebuilds. The tag must already exist in the registry of
+      # this environment and, when the build reported a digest, be that image.
+      - name: Check the image
+        id: image
+        env:
+          REPOSITORY: ${{ steps.cfg.outputs.repository }}
+          IMAGE: ${{ steps.cfg.outputs.image }}
+          EXPECTED_DIGEST: ${{ steps.cfg.outputs.expected_digest }}
+        run: |
+          set -euo pipefail
+          if ! digest="$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=${TAG}" \
+            --query 'imageDetails[0].imageDigest' --output text 2>&1)"; then
+            printf '%s\n' "$digest" >&2
+            echo "::error::${IMAGE} was not found in the registry of ${ENVIRONMENT}."
+            exit 1
+          fi
+          if [ -n "$EXPECTED_DIGEST" ] && [ "$digest" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::${IMAGE} resolves to ${digest}, but the build published ${EXPECTED_DIGEST}."
+            exit 1
+          fi
+          echo "${IMAGE} -> ${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      # A new revision is the latest one of the family with a different image.
+      # Everything else (roles, variables, secrets, sizes, tags) is kept, so a
+      # change that Terraform made to the family reaches the service here.
+      - name: Register the task definitions
+        id: register
+        env:
+          CONTAINER_NAME: ${{ steps.cfg.outputs.container_name }}
+          FAMILY: ${{ steps.cfg.outputs.family }}
+          MIGRATE_FAMILY: ${{ steps.cfg.outputs.migrate_family }}
+          IMAGE: ${{ steps.cfg.outputs.image }}
+        run: |
+          set -euo pipefail
+          shopt -s inherit_errexit
+
+          register() {
+            local family="$1" current next
+            current="${RUNNER_TEMP}/${family}.current.json"
+            next="${RUNNER_TEMP}/${family}.next.json"
+
+            aws ecs describe-task-definition --task-definition "$family" --include TAGS --output json > "$current"
+
+            # Replace the image of the container and drop the fields that
+            # describe a registered revision and cannot be sent back.
+            jq --arg container "$CONTAINER_NAME" --arg image "$IMAGE" '
+              if any(.taskDefinition.containerDefinitions[]; .name == $container) then . else
+                error("the task definition has no container named \($container)")
+              end
+              | (.tags // []) as $tags
+              | .taskDefinition
+              | (.containerDefinitions[] | select(.name == $container) | .image) = $image
+              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+                    .registeredAt, .registeredBy, .deregisteredAt)
+              | if ($tags | length) > 0 then .tags = $tags else . end
+            ' "$current" > "$next"
+
+            aws ecs register-task-definition --cli-input-json "file://${next}" \
+              --query 'taskDefinition.taskDefinitionArn' --output text
+          }
+
+          migrate_arn="$(register "$MIGRATE_FAMILY")"
+          echo "Registered ${migrate_arn}"
+          service_arn="$(register "$FAMILY")"
+          echo "Registered ${service_arn}"
+          {
+            echo "migrate=${migrate_arn}"
+            echo "service=${service_arn}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The migration task is the only one that receives the credentials of the
+      # schema owner. It runs to completion before the service is touched: if
+      # it fails, the service keeps running the previous revision.
+      - name: Run the schema migrations
+        env:
+          TASK_DEFINITION: ${{ steps.register.outputs.migrate }}
+          CONTAINER_NAME: ${{ steps.cfg.outputs.container_name }}
+          SUBNETS: ${{ steps.cfg.outputs.subnets }}
+          SECURITY_GROUP: ${{ steps.cfg.outputs.security_group }}
+          LOG_GROUP: ${{ steps.cfg.outputs.log_group }}
+        run: |
+          set -euo pipefail
+          run_json="${RUNNER_TEMP}/run-task.json"
+          task_json="${RUNNER_TEMP}/task.json"
+
+          aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_DEFINITION" \
+            --launch-type FARGATE \
+            --count 1 \
+            --started-by "github-${GITHUB_RUN_ID}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${SUBNETS}],securityGroups=[${SECURITY_GROUP}],assignPublicIp=DISABLED}" \
+            --output json > "$run_json"
+
+          task_arn="$(jq -r '.tasks[0].taskArn // empty' "$run_json")"
+          if [ -z "$task_arn" ]; then
+            echo "::error::ECS did not start the migration task: $(jq -c '.failures' "$run_json")"
+            exit 1
+          fi
+          echo "Migration task: ${task_arn}"
+
+          deadline=$(( $(date +%s) + MIGRATION_TIMEOUT_MINUTES * 60 ))
+          while :; do
+            status="$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" \
+              --query 'tasks[0].lastStatus' --output text)"
+            if [ "$status" = "STOPPED" ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::The migration task is still ${status} after ${MIGRATION_TIMEOUT_MINUTES} minutes: ${task_arn}"
+              exit 1
+            fi
+            echo "  ${status}"
+            sleep 10
+          done
+
+          aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" --output json > "$task_json"
+          # exitCode is absent when the container never started (image pull or
+          # secret errors); that is a failure too.
+          exit_code="$(jq -r --arg c "$CONTAINER_NAME" \
+            '[.tasks[0].containers[] | select(.name == $c) | .exitCode][0] | if . == null then "none" else tostring end' "$task_json")"
+          stopped_reason="$(jq -r --arg c "$CONTAINER_NAME" \
+            '[.tasks[0].stoppedReason, (.tasks[0].containers[] | select(.name == $c) | .reason)]
+             | map(strings) | join("; ")' "$task_json")"
+
+          echo "::group::Log of the migration task"
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "migrate/${CONTAINER_NAME}/${task_arn##*/}" \
+            --start-from-head --output json | jq -r '.events[].message' ||
+            echo "::warning::The log of the migration task could not be read."
+          echo "::endgroup::"
+
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::The migration task failed (exit code: ${exit_code}; ${stopped_reason}). The service was not updated."
+            exit 1
+          fi
+          echo "Migrations applied (exit code 0)."
+
+      # The services have the deployment circuit breaker with rollback: when
+      # the new tasks do not become healthy, ECS returns to the previous
+      # revision by itself. This step follows the deployment it started and
+      # fails when that deployment does not complete, so a rollback is never
+      # reported as a successful release.
+      - name: Update the service and wait for the rollout
+        env:
+          SERVICE_NAME: ${{ steps.cfg.outputs.service_name }}
+          TASK_DEFINITION: ${{ steps.register.outputs.service }}
+        run: |
+          set -euo pipefail
+          service_json="${RUNNER_TEMP}/service.json"
+
+          deployment_id="$(aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$SERVICE_NAME" \
+            --task-definition "$TASK_DEFINITION" \
+            --query "service.deployments[?status=='PRIMARY'] | [0].id" --output text)"
+          echo "Deployment: ${deployment_id}"
+
+          events() {
+            echo "::group::Last events of the service"
+            jq -r '.services[0].events[:15][] | "\(.createdAt)  \(.message)"' "$service_json"
+            echo "::endgroup::"
+          }
+
+          deadline=$(( $(date +%s) + ROLLOUT_TIMEOUT_MINUTES * 60 ))
+          while :; do
+            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$SERVICE_NAME" --output json > "$service_json"
+            state="$(jq -r --arg id "$deployment_id" \
+              '[.services[0].deployments[] | select(.id == $id)][0]
+               | if . == null then "GONE" else "\(.rolloutState // "UNKNOWN") \(.runningCount)/\(.desiredCount)" end' "$service_json")"
+            echo "  ${state}"
+
+            case "$state" in
+              COMPLETED*)
+                break
+                ;;
+              FAILED*)
+                events
+                echo "::error::The deployment failed and ECS is rolling the service back to the previous revision."
+                exit 1
+                ;;
+              GONE)
+                events
+                echo "::error::The deployment is no longer active: it was rolled back or replaced by another one."
+                exit 1
+                ;;
+            esac
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              events
+              echo "::error::The deployment did not complete in ${ROLLOUT_TIMEOUT_MINUTES} minutes."
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.cfg.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          TASK_DEFINITION: ${{ steps.register.outputs.service }}
+          MIGRATE_TASK_DEFINITION: ${{ steps.register.outputs.migrate }}
+        run: |
+          {
+            echo "### ${SERVICE} in ${ENVIRONMENT}"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Service task definition: \`${TASK_DEFINITION}\`"
+            echo "- Migration task definition: \`${MIGRATE_TASK_DEFINITION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
